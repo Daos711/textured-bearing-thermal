@@ -6,77 +6,32 @@
 
 Запуск:
     cd textured-bearing-thermal
-    python -m examples.roller_cone_bit_analysis
+    python examples/roller_cone_bit_analysis.py
 """
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Добавляем корневую папку проекта в путь
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+# Папка для результатов
+RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 
-# Настройка шрифтов для кириллицы
+# Настройка шрифтов
 rcParams['font.family'] = 'DejaVu Sans'
 
-from src.parameters import (
-    BearingModel,
-    BearingGeometry,
-    TextureParameters,
-    LubricantProperties,
-    OperatingConditions,
-    GridParameters,
-)
+from src.parameters import create_roller_cone_bit_bearing
 from src.geometry import create_grid, compute_film_thickness
-from src.reynolds import solve_reynolds_static, ReynoldsSolver
-from src.thermal import THDSolver, estimate_temperature_rise, compute_viscosity_field
+from src.reynolds import solve_reynolds_static
+from src.thermal import THDSolver, estimate_temperature_rise
 from src.forces import integrate_forces, compute_friction, BearingAnalyzer
-
-
-def create_roller_cone_model(T_inlet: float = 80.0, n_rpm: float = 100.0) -> BearingModel:
-    """
-    Создание модели опоры шарошечного долота.
-
-    Args:
-        T_inlet: температура на забое (°C)
-        n_rpm: скорость вращения (об/мин)
-    """
-    return BearingModel(
-        geometry=BearingGeometry(
-            R=0.025,        # 25 мм — радиус цапфы
-            c=0.0002,       # 0.2 мм — радиальный зазор
-            L=0.035,        # 35 мм — длина опоры
-        ),
-        texture=TextureParameters(
-            enabled=True,
-            h_p=0.00006,    # 60 мкм — глубина углублений
-            a=0.0015,       # полуось по Z
-            b=0.0012,       # полуось по φ
-            N_phi=6,        # углублений по окружности
-            N_Z=8,          # углублений по длине
-            phi_start_deg=90.0,
-            phi_end_deg=270.0,
-        ),
-        lubricant=LubricantProperties(
-            eta_0=0.02,         # 20 мПа·с при 40°C — консистентная смазка
-            T_0=40.0,
-            beta=0.025,         # температурный коэффициент
-            rho=900.0,
-            c_p=2000.0,
-            k=0.15,
-        ),
-        operating=OperatingConditions(
-            n=n_rpm,
-            epsilon=0.5,
-            T_inlet=T_inlet,
-            T_ambient=T_inlet + 20.0,
-        ),
-        grid=GridParameters(
-            num_phi=360,
-            num_Z=100,
-        ),
-    )
 
 
 def analyze_temperature_effect():
@@ -95,7 +50,7 @@ def analyze_temperature_effect():
     for T in temperatures:
         print(f"\nТемпература забоя: {T}°C")
 
-        model = create_roller_cone_model(T_inlet=T)
+        model = create_roller_cone_bit_bearing(n_rpm=150.0, T_inlet=T)
         analyzer = BearingAnalyzer(model)
 
         # Гладкий подшипник
@@ -122,9 +77,10 @@ def analyze_temperature_effect():
               f"μ = {res_tex['friction'].friction_coeff:.5f}")
 
         # Эффект текстуры
-        delta_mu = (res_tex['friction'].friction_coeff -
-                   res_smooth['friction'].friction_coeff)
-        print(f"  Снижение трения: {-delta_mu/res_smooth['friction'].friction_coeff*100:.1f}%")
+        if res_smooth['friction'].friction_coeff > 0:
+            delta_mu = (res_tex['friction'].friction_coeff -
+                       res_smooth['friction'].friction_coeff)
+            print(f"  Изменение трения: {delta_mu/res_smooth['friction'].friction_coeff*100:+.1f}%")
 
     return temperatures, results_smooth, results_textured
 
@@ -137,7 +93,7 @@ def analyze_eccentricity_effect():
     print("АНАЛИЗ ВЛИЯНИЯ ЭКСЦЕНТРИСИТЕТА")
     print("=" * 60)
 
-    model = create_roller_cone_model(T_inlet=80.0)
+    model = create_roller_cone_bit_bearing(n_rpm=150.0, T_inlet=80.0)
 
     epsilons = np.linspace(0.1, 0.8, 8)
 
@@ -164,24 +120,69 @@ def analyze_eccentricity_effect():
     return epsilons, F_smooth, F_textured, mu_smooth, mu_textured
 
 
-def plot_results(temp_data, eps_data):
+def analyze_speed_effect():
+    """
+    Анализ влияния скорости вращения.
+    """
+    print("\n" + "=" * 60)
+    print("АНАЛИЗ ВЛИЯНИЯ СКОРОСТИ ВРАЩЕНИЯ")
+    print("=" * 60)
+
+    speeds = [50, 100, 150, 200, 250]  # об/мин
+
+    F_smooth = []
+    F_textured = []
+    delta_T_list = []
+
+    for n in speeds:
+        model = create_roller_cone_bit_bearing(n_rpm=n, T_inlet=80.0)
+        analyzer = BearingAnalyzer(model)
+
+        res_s = analyzer.analyze(with_texture=False, compute_dynamics=False)
+        res_t = analyzer.analyze(with_texture=True, compute_dynamics=False)
+
+        F_smooth.append(res_s['forces'].F_total)
+        F_textured.append(res_t['forces'].F_total)
+
+        delta_T = estimate_temperature_rise(model)
+        delta_T_list.append(delta_T)
+
+        print(f"n = {n} об/мин: F = {res_s['forces'].F_total:.1f} Н, ΔT ≈ {delta_T:.1f}°C")
+
+    return speeds, F_smooth, F_textured, delta_T_list
+
+
+def plot_results(temp_data, eps_data, speed_data):
     """Построение графиков результатов."""
     temperatures, results_smooth, results_textured = temp_data
-    epsilons, F_smooth, F_textured, mu_smooth, mu_textured = eps_data
+    epsilons, F_smooth_eps, F_textured_eps, mu_smooth_eps, mu_textured_eps = eps_data
+    speeds, F_smooth_spd, F_textured_spd, delta_T_list = speed_data
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
     # 1. Вязкость от температуры
     ax = axes[0, 0]
     eta_values = [r['eta'] for r in results_smooth]
-    ax.plot(temperatures, eta_values, 'o-', linewidth=2, markersize=8)
+    ax.plot(temperatures, eta_values, 'o-', linewidth=2, markersize=8, color='blue')
     ax.set_xlabel('Температура, °C')
     ax.set_ylabel('Вязкость, мПа·с')
     ax.set_title('Зависимость вязкости от температуры')
     ax.grid(True)
 
-    # 2. Коэффициент трения от температуры
+    # 2. Несущая способность от температуры
     ax = axes[0, 1]
+    F_s = [r['F'] for r in results_smooth]
+    F_t = [r['F'] for r in results_textured]
+    ax.plot(temperatures, F_s, 'o-', label='Гладкий', linewidth=2, markersize=8)
+    ax.plot(temperatures, F_t, 's--', label='С текстурой', linewidth=2, markersize=8)
+    ax.set_xlabel('Температура, °C')
+    ax.set_ylabel('Несущая способность F, Н')
+    ax.set_title('Влияние температуры на несущую способность')
+    ax.legend()
+    ax.grid(True)
+
+    # 3. Коэффициент трения от температуры
+    ax = axes[0, 2]
     mu_s = [r['mu'] for r in results_smooth]
     mu_t = [r['mu'] for r in results_textured]
     ax.plot(temperatures, mu_s, 'o-', label='Гладкий', linewidth=2, markersize=8)
@@ -192,29 +193,39 @@ def plot_results(temp_data, eps_data):
     ax.legend()
     ax.grid(True)
 
-    # 3. Несущая способность от эксцентриситета
+    # 4. Несущая способность от эксцентриситета
     ax = axes[1, 0]
-    ax.plot(epsilons, F_smooth, 'o-', label='Гладкий', linewidth=2, markersize=8)
-    ax.plot(epsilons, F_textured, 's--', label='С текстурой', linewidth=2, markersize=8)
+    ax.plot(epsilons, F_smooth_eps, 'o-', label='Гладкий', linewidth=2, markersize=8)
+    ax.plot(epsilons, F_textured_eps, 's--', label='С текстурой', linewidth=2, markersize=8)
     ax.set_xlabel('Эксцентриситет ε')
     ax.set_ylabel('Несущая способность F, Н')
     ax.set_title('Несущая способность от эксцентриситета')
     ax.legend()
     ax.grid(True)
 
-    # 4. Коэффициент трения от эксцентриситета
+    # 5. Несущая способность от скорости
     ax = axes[1, 1]
-    ax.plot(epsilons, mu_smooth, 'o-', label='Гладкий', linewidth=2, markersize=8)
-    ax.plot(epsilons, mu_textured, 's--', label='С текстурой', linewidth=2, markersize=8)
-    ax.set_xlabel('Эксцентриситет ε')
-    ax.set_ylabel('Коэффициент трения μ')
-    ax.set_title('Коэффициент трения от эксцентриситета')
+    ax.plot(speeds, F_smooth_spd, 'o-', label='Гладкий', linewidth=2, markersize=8)
+    ax.plot(speeds, F_textured_spd, 's--', label='С текстурой', linewidth=2, markersize=8)
+    ax.set_xlabel('Скорость вращения, об/мин')
+    ax.set_ylabel('Несущая способность F, Н')
+    ax.set_title('Несущая способность от скорости')
     ax.legend()
     ax.grid(True)
 
+    # 6. Подъём температуры от скорости
+    ax = axes[1, 2]
+    ax.plot(speeds, delta_T_list, 'o-', linewidth=2, markersize=8, color='red')
+    ax.set_xlabel('Скорость вращения, об/мин')
+    ax.set_ylabel('ΔT, °C')
+    ax.set_title('Оценка нагрева от скорости')
+    ax.grid(True)
+
     plt.tight_layout()
-    plt.savefig('roller_cone_bit_results.png', dpi=150)
-    print("\nГрафики сохранены в roller_cone_bit_results.png")
+
+    filepath = os.path.join(RESULTS_DIR, 'roller_cone_bit_results.png')
+    plt.savefig(filepath, dpi=150)
+    print(f"\nГрафики сохранены в {filepath}")
     plt.show()
 
 
@@ -226,7 +237,8 @@ def run_thd_analysis():
     print("ТЕРМОГИДРОДИНАМИЧЕСКИЙ АНАЛИЗ (THD)")
     print("=" * 60)
 
-    model = create_roller_cone_model(T_inlet=80.0)
+    model = create_roller_cone_bit_bearing(n_rpm=200.0, T_inlet=80.0)
+    print(model.info())
 
     # Оценка подъёма температуры
     delta_T_est = estimate_temperature_rise(model)
@@ -298,8 +310,10 @@ def run_thd_analysis():
     ax.grid(True)
 
     plt.tight_layout()
-    plt.savefig('thd_analysis_results.png', dpi=150)
-    print("\nГрафики THD сохранены в thd_analysis_results.png")
+
+    filepath = os.path.join(RESULTS_DIR, 'thd_analysis_results.png')
+    plt.savefig(filepath, dpi=150)
+    print(f"\nГрафики THD сохранены в {filepath}")
     plt.show()
 
 
@@ -311,7 +325,7 @@ def main():
     print("=" * 60)
 
     # Информация о модели
-    model = create_roller_cone_model()
+    model = create_roller_cone_bit_bearing()
     print(model.info())
 
     # Анализ влияния температуры
@@ -320,14 +334,18 @@ def main():
     # Анализ влияния эксцентриситета
     eps_data = analyze_eccentricity_effect()
 
+    # Анализ влияния скорости
+    speed_data = analyze_speed_effect()
+
     # Построение графиков
-    plot_results(temp_data, eps_data)
+    plot_results(temp_data, eps_data, speed_data)
 
     # THD анализ
     run_thd_analysis()
 
     print("\n" + "=" * 60)
     print("АНАЛИЗ ЗАВЕРШЁН")
+    print(f"Результаты сохранены в папке: {RESULTS_DIR}")
     print("=" * 60)
 
 

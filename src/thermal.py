@@ -205,15 +205,16 @@ class ThermalModel:
         # Характерные величины
         self.D_over_L = model.geometry.D / model.geometry.L
 
-        # Число Пекле
+        # Число Пекле (отношение конвекции к теплопроводности)
         # Pe = ρ·c_p·U·c / k
         self.Pe = (model.lubricant.rho * model.lubricant.c_p *
                    model.U * model.geometry.c / model.lubricant.k)
 
         # Масштаб температуры (подъём от диссипации)
-        # ΔT ~ η·U²·L / (k·c)
+        # Используем число Бринкмана: Br = η·U² / (k·ΔT)
+        # ΔT_ref ~ η·U² / k · (R/c) — характерный подъём
         eta_ref = model.lubricant.viscosity(model.operating.T_inlet)
-        self.delta_T_ref = (eta_ref * model.U ** 2 * model.geometry.L /
+        self.delta_T_ref = (eta_ref * model.U ** 2 * model.geometry.R /
                            (model.lubricant.k * model.geometry.c))
 
     def compute_temperature_field(
@@ -355,13 +356,14 @@ class THDSolver:
 
 def estimate_temperature_rise(model: BearingModel) -> float:
     """
-    Оценка подъёма температуры в подшипнике (упрощённая формула).
+    Оценка подъёма температуры в подшипнике.
 
-    ΔT ≈ η·U²·L / (ρ·c_p·Q)
+    Используем баланс энергии:
+        Тепловыделение = η·(U/h)²·V = η·U²·(2π·R·L·c)/c² = 2π·η·U²·R·L/c
+        Теплоотвод = ρ·c_p·Q·ΔT, где Q ~ π·R·c·U (расход через зазор)
 
-    где Q — расход смазки.
-
-    Для шарошечного долота это даёт порядок величины.
+    ΔT = Тепловыделение / (ρ·c_p·Q)
+       = 2·η·U·L / (ρ·c_p·c²)
 
     Args:
         model: параметры подшипника
@@ -370,17 +372,23 @@ def estimate_temperature_rise(model: BearingModel) -> float:
         ΔT: оценка подъёма температуры (°C)
     """
     eta = model.lubricant.viscosity(model.operating.T_inlet)
+    U = model.U
+    c = model.geometry.c
+    L = model.geometry.L
+    R = model.geometry.R
+    rho = model.lubricant.rho
+    c_p = model.lubricant.c_p
 
-    # Характерный расход Q ~ U·c·L
-    Q = model.U * model.geometry.c * model.geometry.L
+    # Тепловыделение от вязкого трения (Вт)
+    # Q_gen = η·(U/c)²·(2π·R·L·c) = 2π·η·U²·R·L/c
+    Q_gen = 2 * np.pi * eta * U**2 * R * L / c
 
-    # Тепловыделение ~ η·U²·(объём зазора)/h
-    # Объём ~ 2π·R·L·c
-    volume = 2 * np.pi * model.geometry.R * model.geometry.L * model.geometry.c
-    heat_gen = eta * (model.U / model.geometry.c) ** 2 * volume
+    # Расход смазки через зазор (м³/с)
+    # Q_flow ~ π·R·c·U (приближённо, половина скорости в среднем)
+    Q_flow = 0.5 * np.pi * R * c * U
 
     # Подъём температуры
-    delta_T = heat_gen / (model.lubricant.rho * model.lubricant.c_p * Q)
+    delta_T = Q_gen / (rho * c_p * Q_flow + 1e-12)
 
     return delta_T
 

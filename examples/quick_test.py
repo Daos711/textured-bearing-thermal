@@ -119,7 +119,7 @@ def test_thermal():
     from src.reynolds import solve_reynolds_static
     from src.parameters import create_roller_cone_bit_bearing
 
-    model = create_roller_cone_bit_bearing()
+    model = create_roller_cone_bit_bearing(n_rpm=150.0, T_inlet=80.0)
     grid = create_grid(180, 50)
     D_over_L = model.geometry.D / model.geometry.L
 
