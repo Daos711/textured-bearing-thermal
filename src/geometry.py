@@ -4,14 +4,16 @@
 Система координат:
 - φ ∈ [0, 2π]: угол от линии центров
 - Z ∈ [-1, 1]: безразмерная осевая координата, Z = 2z/L
-- φ = 0 соответствует минимальному зазору (h_min = c(1-ε))
-- φ = π соответствует максимальному зазору (h_max = c(1+ε))
+- φ = 0 соответствует максимальному зазору (h_max = c(1+ε))
+- φ = π соответствует минимальному зазору (h_min = c(1-ε))
 
 Безразмерный зазор:
-    H = h/c = 1 - ε·cos(φ)
+    H = h/c = 1 + ε·cos(φ)
 
-Обратите внимание: здесь "-cos(φ)", а не "+cos(φ)" как в исходном коде.
-Это обеспечивает минимум при φ=0, что соответствует стандартной системе координат.
+При φ=0: H = 1+ε (максимум)
+При φ=π: H = 1-ε (минимум, зона нагрузки)
+
+Текстура располагается в зоне 90°-270° — это зона высокого давления.
 """
 
 import numpy as np
@@ -115,8 +117,8 @@ def compute_film_thickness(
         H: безразмерная толщина плёнки (N_Z x N_phi)
     """
     # Базовый зазор (гладкий подшипник)
-    # Минус перед cos — минимум при φ=0
-    H = 1 - epsilon * np.cos(grid.Phi_mesh)
+    # Плюс перед cos — минимум при φ=π (зона нагрузки)
+    H = 1 + epsilon * np.cos(grid.Phi_mesh)
 
     # Добавляем текстуру если есть
     if texture is not None and texture.enabled:
@@ -244,7 +246,7 @@ def compute_film_thickness_dynamic(
 
     Используется для динамических расчётов (орбиты).
 
-    H(φ) = 1 - εx·cos(φ) - εy·sin(φ)
+    H(φ) = 1 + εx·cos(φ) + εy·sin(φ)
 
     где εx, εy — компоненты эксцентриситета по осям x и y.
 
@@ -258,7 +260,7 @@ def compute_film_thickness_dynamic(
     Returns:
         H: безразмерная толщина плёнки
     """
-    H = 1 - epsilon_x * np.cos(grid.Phi_mesh) - epsilon_y * np.sin(grid.Phi_mesh)
+    H = 1 + epsilon_x * np.cos(grid.Phi_mesh) + epsilon_y * np.sin(grid.Phi_mesh)
 
     if texture is not None and texture.enabled:
         H_tex = compute_texture_contribution(grid, geometry, texture)
