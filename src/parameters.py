@@ -228,8 +228,8 @@ def create_roller_cone_bit_bearing(
             b=0.0010,       # полуось по φ
             N_phi=8,        # углублений по окружности
             N_Z=6,          # углублений по длине
-            phi_start_deg=120.0,  # Зона высокого давления!
-            phi_end_deg=240.0,
+            phi_start_deg=90.0,   # Зона текстуры: 90° - 270°
+            phi_end_deg=270.0,
         ),
         lubricant=LubricantProperties(
             eta_0=0.05,         # 50 мПа·с при 40°C — вязкое масло для долот

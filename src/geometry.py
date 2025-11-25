@@ -158,7 +158,7 @@ def compute_texture_contribution(
     B = texture.b / geometry.R       # полуось по φ
 
     # Центры углублений
-    phi_centers, Z_centers = compute_depression_centers(texture)
+    phi_centers, Z_centers = compute_depression_centers(texture, geometry)
 
     # Добавляем каждое углубление
     for phi_c in phi_centers:
@@ -182,34 +182,52 @@ def compute_texture_contribution(
 
 def compute_depression_centers(
     texture: TextureParameters,
+    geometry: BearingGeometry,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Вычисление координат центров углублений.
 
-    Углубления равномерно распределены в зоне [phi_start, phi_end] × [-1, 1].
+    Углубления равномерно распределены в зоне [phi_start, phi_end] × [-1, 1]
+    с учётом их размеров (чтобы не перекрывались и не выходили за границы).
+
+    Формулы из исходной модели:
+        delta_phi_gap = (phi_end - phi_start - 2*N_phi*B) / (N_phi - 1)
+        delta_phi_center = 2*B + delta_phi_gap
+        phi_c[k] = phi_start + B + k * delta_phi_center
 
     Returns:
-        phi_centers: координаты центров по φ
-        Z_centers: координаты центров по Z
+        phi_centers: координаты центров по φ (рад)
+        Z_centers: координаты центров по Z (безразмерные)
     """
-    # Безразмерные полуоси (используем для расчёта зазоров)
-    # Здесь нужны абсолютные значения для расчёта расположения
-    # Примем что A и B уже заданы в texture
+    # Безразмерные полуоси
+    A = 2 * texture.a / geometry.L  # полуось по Z
+    B = texture.b / geometry.R       # полуось по φ
 
-    # Упрощённый расчёт: равномерное распределение центров
-    phi_centers = np.linspace(
-        texture.phi_start,
-        texture.phi_end,
-        texture.N_phi,
-        endpoint=True
-    )
+    N_phi = texture.N_phi
+    N_Z = texture.N_Z
 
-    Z_centers = np.linspace(
-        -0.9,  # не совсем до края
-        0.9,
-        texture.N_Z,
-        endpoint=True
-    )
+    # === Центры по φ ===
+    phi_start = texture.phi_start
+    phi_end = texture.phi_end
+
+    if N_phi > 1:
+        # Зазор между углублениями по φ
+        delta_phi_gap = (phi_end - phi_start - 2 * N_phi * B) / (N_phi - 1)
+        delta_phi_center = 2 * B + delta_phi_gap
+        phi_center_start = phi_start + B
+        phi_centers = phi_center_start + delta_phi_center * np.arange(N_phi)
+    else:
+        phi_centers = np.array([(phi_start + phi_end) / 2])
+
+    # === Центры по Z ===
+    # Z от -1 до 1, полная длина = 2
+    if N_Z > 1:
+        delta_Z_gap = (2 - 2 * N_Z * A) / (N_Z - 1)
+        delta_Z_center = 2 * A + delta_Z_gap
+        Z_center_start = -1 + A
+        Z_centers = Z_center_start + delta_Z_center * np.arange(N_Z)
+    else:
+        Z_centers = np.array([0.0])
 
     return phi_centers, Z_centers
 
