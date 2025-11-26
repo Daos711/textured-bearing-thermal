@@ -1,282 +1,405 @@
 """
-Параметры подшипника скольжения для шарошечного долота.
+Параметры модели подшипника скольжения.
 
-Система координат:
-- φ (phi): угол от линии центров (0..2π), φ=0 — минимальный зазор
-- z: осевая координата (-L/2..+L/2), безразмерная Z = 2z/L ∈ [-1, 1]
-- Ось x направлена по линии центров (от центра втулки к центру вала)
-- Ось y перпендикулярна x в плоскости вращения
+Структура параметров согласно постановке задачи:
+- Геометрия: R_J, R_B, c0, L
+- Текстура: h_p, a, b, параметры филлотаксиса
+- Материалы: alpha_J, alpha_B, T_ref
+- Смазка: eta_ref, beta_eta
+- Режим работы: n, W_min, W_max, T_min, T_max
+- Численные настройки: N_phi, N_Z, tol, omega_GS
 """
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Callable
 
 
 @dataclass
 class BearingGeometry:
     """Геометрия подшипника."""
-    R: float = 0.035        # Радиус вала (м)
-    c: float = 0.0005       # Радиальный зазор (м)
-    L: float = 0.056        # Длина подшипника (м)
+    R_J: float          # Радиус шейки (вала), м
+    R_B: float          # Радиус вкладыша, м
+    L: float            # Длина подшипника, м
 
     @property
-    def D(self) -> float:
-        """Диаметр вала."""
-        return 2 * self.R
+    def c0(self) -> float:
+        """Радиальный зазор при T_ref, м."""
+        return self.R_B - self.R_J
+
+    @property
+    def D_J(self) -> float:
+        """Диаметр шейки, м."""
+        return 2 * self.R_J
 
     @property
     def psi(self) -> float:
-        """Относительный зазор ψ = c/R."""
-        return self.c / self.R
+        """Относительный зазор ψ = c0/R_J."""
+        return self.c0 / self.R_J
 
     @property
-    def L_over_D(self) -> float:
-        """Отношение L/D."""
-        return self.L / self.D
+    def lambda_ratio(self) -> float:
+        """Отношение длин λ = 2*R_J/L."""
+        return 2 * self.R_J / self.L
 
 
 @dataclass
 class TextureParameters:
     """Параметры текстуры (эллипсоидальные углубления)."""
-    enabled: bool = True
-    h_p: float = 0.0001     # Глубина углубления (м)
-    a: float = 0.00241      # Полуось по Z (м)
-    b: float = 0.002214     # Полуось по φ (м)
-    N_phi: int = 8          # Количество углублений по φ
-    N_Z: int = 11           # Количество углублений по Z
-    phi_start_deg: float = 90.0   # Начальный угол зоны текстуры (°)
-    phi_end_deg: float = 270.0    # Конечный угол зоны текстуры (°)
+    enabled: bool = False
 
-    @property
-    def phi_start(self) -> float:
-        """Начальный угол в радианах."""
-        return np.deg2rad(self.phi_start_deg)
+    # Геометрия углубления
+    h_p: float = 10e-6      # Глубина углубления, м
+    a: float = 1e-3         # Полуось по z (осевая), м
+    b: float = 1e-3         # Полуось по окружности, м
 
-    @property
-    def phi_end(self) -> float:
-        """Конечный угол в радианах."""
-        return np.deg2rad(self.phi_end_deg)
+    # Филлотаксическое расположение
+    use_phyllotaxis: bool = True
+    T_spirals: int = 8          # Число спиралей
+    alpha_step_deg: float = 15  # Угловой шаг вдоль спирали, градусы
+    c_step: float = 4e-3        # Шаг по высоте между точками, м
+
+    # Зона размещения текстуры (в радианах)
+    phi_min: float = np.pi/2    # 90°
+    phi_max: float = 3*np.pi/2  # 270°
+    Z_min: float = -1.0         # Безразмерная координата
+    Z_max: float = 1.0          # Безразмерная координата
+
+    # Для регулярной сетки (если use_phyllotaxis=False)
+    N_phi: int = 8      # Число углублений по окружности
+    N_Z: int = 6        # Число рядов по оси z
+
+
+@dataclass
+class MaterialProperties:
+    """Свойства материалов (тепловое расширение)."""
+    alpha_J: float = 12e-6      # Коэф. линейного расширения вала, 1/°C
+    alpha_B: float = 18e-6      # Коэф. линейного расширения вкладыша, 1/°C
+    T_ref: float = 20.0         # Опорная температура, °C
+
+    def clearance_change(self, geometry: BearingGeometry, T: float) -> float:
+        """
+        Изменение зазора из-за теплового расширения.
+
+        Δc_T = R_B0 * α_B * ΔT - R_J0 * α_J * ΔT
+
+        Returns:
+            Δc_T: изменение зазора, м
+        """
+        delta_T = T - self.T_ref
+        delta_c = geometry.R_B * self.alpha_B * delta_T - geometry.R_J * self.alpha_J * delta_T
+        return delta_c
+
+    def H_T(self, geometry: BearingGeometry, T: float) -> float:
+        """
+        Безразмерная добавка к зазору от температуры.
+
+        H_T = Δc_T / c0
+        """
+        delta_c = self.clearance_change(geometry, T)
+        return delta_c / geometry.c0
 
 
 @dataclass
 class LubricantProperties:
-    """
-    Свойства смазки с температурной зависимостью.
-
-    Вязкость по формуле Vogel-Cameron:
-        η(T) = η_0 * exp(-β * (T - T_0))
-
-    Или по формуле Walther (более точная для масел):
-        log(log(ν + 0.7)) = A - B * log(T)
-    """
-    eta_0: float = 0.01105      # Динамическая вязкость при T_0 (Па·с)
-    T_0: float = 40.0           # Референсная температура (°C)
-    beta: float = 0.03          # Коэффициент температурной зависимости (1/K)
-    rho: float = 870.0          # Плотность (кг/м³)
-    c_p: float = 2000.0         # Удельная теплоёмкость (Дж/(кг·K))
-    k: float = 0.14             # Теплопроводность (Вт/(м·K))
+    """Свойства смазки."""
+    eta_ref: float = 0.05       # Вязкость при T_ref, Па·с
+    beta_eta: float = 0.03      # Параметр температурной зависимости, 1/°C
+    T_ref: float = 40.0         # Опорная температура для вязкости, °C
+    rho: float = 870.0          # Плотность, кг/м³
+    c_p: float = 2000.0         # Теплоёмкость, Дж/(кг·°C)
 
     def viscosity(self, T: float) -> float:
         """
-        Вязкость при температуре T.
-
-        Args:
-            T: Температура (°C)
-
-        Returns:
-            Динамическая вязкость η (Па·с)
+        Динамическая вязкость η(T) = η_ref * exp(-β_η * (T - T_ref)).
         """
-        return self.eta_0 * np.exp(-self.beta * (T - self.T_0))
+        return self.eta_ref * np.exp(-self.beta_eta * (T - self.T_ref))
 
-    def viscosity_array(self, T: np.ndarray) -> np.ndarray:
-        """Вязкость для массива температур."""
-        return self.eta_0 * np.exp(-self.beta * (T - self.T_0))
+    def eta_hat(self, T: float) -> float:
+        """
+        Безразмерная вязкость η̂ = η(T) / η_ref.
+        """
+        return np.exp(-self.beta_eta * (T - self.T_ref))
 
 
 @dataclass
 class OperatingConditions:
-    """Условия работы подшипника."""
-    n: float = 100.0            # Скорость вращения (об/мин) — для долота меньше!
-    epsilon: float = 0.6        # Эксцентриситет (0..1)
-    T_inlet: float = 60.0       # Температура на входе (°C)
-    T_ambient: float = 80.0     # Температура окружающей среды/забоя (°C)
+    """Режим работы."""
+    n_rpm: float = 100.0        # Частота вращения, об/мин
+
+    # Диапазоны для параметрического расчёта
+    W_min: float = 100.0        # Минимальная нагрузка, Н
+    W_max: float = 5000.0       # Максимальная нагрузка, Н
+    T_min: float = 40.0         # Минимальная температура, °C
+    T_max: float = 120.0        # Максимальная температура, °C
+
+    # Число точек для построения поверхностей
+    N_W: int = 20               # Точек по нагрузке
+    N_T: int = 15               # Точек по температуре
 
     @property
     def omega(self) -> float:
-        """Угловая скорость (рад/с)."""
-        return 2 * np.pi * self.n / 60
+        """Угловая скорость, рад/с."""
+        return 2 * np.pi * self.n_rpm / 60
+
+    def U(self, R_J: float) -> float:
+        """Окружная скорость поверхности шейки, м/с."""
+        return self.omega * R_J
 
 
 @dataclass
-class GridParameters:
-    """Параметры расчётной сетки."""
-    num_phi: int = 360      # Узлов по φ
-    num_Z: int = 100        # Узлов по Z
+class NumericalSettings:
+    """Численные настройки."""
+    N_phi: int = 360            # Число узлов по φ
+    N_Z: int = 100              # Число узлов по Z
+    tol_Re: float = 1e-6        # Допуск сходимости решателя Рейнольдса
+    max_iter_Re: int = 10000    # Макс. число итераций
+    omega_GS: float = 1.7       # Параметр релаксации Гаусса-Зейделя
+    use_cavitation: bool = True # Условие P ≥ 0
 
-
-@dataclass
-class SolverSettings:
-    """Настройки численного решателя."""
-    max_iter: int = 50000       # Максимум итераций
-    tol: float = 1e-6           # Критерий сходимости
-    relaxation: float = 1.5     # Параметр релаксации (SOR)
-
-    # Для термогидродинамической модели
-    thd_max_iter: int = 20      # Итерации связи Reynolds-Energy
-    thd_tol: float = 1e-3       # Критерий сходимости по температуре
+    # Для конечных разностей при вычислении K, C
+    delta_xi: float = 1e-4      # Δξ для жёсткости
+    delta_xi_dot: float = 1e-4  # Δξ' для демпфирования
 
 
 @dataclass
 class BearingModel:
-    """
-    Полная модель подшипника — собирает все параметры.
-    """
-    geometry: BearingGeometry = field(default_factory=BearingGeometry)
-    texture: TextureParameters = field(default_factory=TextureParameters)
-    lubricant: LubricantProperties = field(default_factory=LubricantProperties)
-    operating: OperatingConditions = field(default_factory=OperatingConditions)
-    grid: GridParameters = field(default_factory=GridParameters)
-    solver: SolverSettings = field(default_factory=SolverSettings)
+    """Полная модель подшипника."""
+    geometry: BearingGeometry
+    texture: TextureParameters
+    material: MaterialProperties
+    lubricant: LubricantProperties
+    operating: OperatingConditions
+    numerical: NumericalSettings
 
-    @property
-    def U(self) -> float:
-        """Линейная скорость поверхности вала (м/с)."""
-        return self.operating.omega * self.geometry.R
-
-    @property
-    def pressure_scale(self) -> float:
+    def pressure_scale(self, T: float) -> float:
         """
-        Масштаб давления для безразмерных величин.
-        P* = P / pressure_scale
+        Масштаб давления p0 = 6 * η(T) * U * R_J / c0².
         """
-        eta = self.lubricant.viscosity(self.operating.T_inlet)
-        return (6 * eta * self.U * self.geometry.R) / (self.geometry.c ** 2)
+        eta = self.lubricant.viscosity(T)
+        U = self.operating.U(self.geometry.R_J)
+        return 6 * eta * U * self.geometry.R_J / self.geometry.c0**2
 
-    @property
-    def load_scale(self) -> float:
-        """Масштаб нагрузки (Н)."""
-        return self.pressure_scale * self.geometry.R * self.geometry.L / 2
+    def force_scale(self, T: float) -> float:
+        """
+        Масштаб силы F_scale = p0 * R_J * L = 6 * η * U * R_J² * L / c0².
+        """
+        return self.pressure_scale(T) * self.geometry.R_J * self.geometry.L
 
-    @property
-    def friction_scale(self) -> float:
-        """Масштаб силы трения (Н)."""
-        eta = self.lubricant.viscosity(self.operating.T_inlet)
-        return (eta * self.U * self.geometry.R * self.geometry.L) / self.geometry.c
+    def K_scale(self, T: float) -> float:
+        """
+        Масштаб жёсткости K_scale = η * ω * L / ψ³.
+        """
+        eta = self.lubricant.viscosity(T)
+        psi = self.geometry.psi
+        return eta * self.operating.omega * self.geometry.L / psi**3
 
-    def info(self) -> str:
+    def C_scale(self, T: float) -> float:
+        """
+        Масштаб демпфирования C_scale = η * L / ψ³.
+        """
+        eta = self.lubricant.viscosity(T)
+        psi = self.geometry.psi
+        return eta * self.geometry.L / psi**3
+
+    def info(self, T: float = 80.0) -> str:
         """Информация о модели."""
-        eta = self.lubricant.viscosity(self.operating.T_inlet)
+        eta = self.lubricant.viscosity(T)
+        U = self.operating.U(self.geometry.R_J)
         lines = [
             "=" * 50,
             "ПАРАМЕТРЫ МОДЕЛИ ПОДШИПНИКА",
             "=" * 50,
             f"Геометрия:",
-            f"  Радиус R = {self.geometry.R*1000:.2f} мм",
-            f"  Зазор c = {self.geometry.c*1000:.3f} мм",
-            f"  Длина L = {self.geometry.L*1000:.2f} мм",
-            f"  L/D = {self.geometry.L_over_D:.2f}",
-            f"  ψ = c/R = {self.geometry.psi:.4f}",
+            f"  R_J = {self.geometry.R_J*1000:.2f} мм",
+            f"  R_B = {self.geometry.R_B*1000:.2f} мм",
+            f"  c0 = {self.geometry.c0*1e6:.1f} мкм",
+            f"  L = {self.geometry.L*1000:.1f} мм",
+            f"  ψ = c0/R_J = {self.geometry.psi:.6f}",
+            f"  λ = 2R_J/L = {self.geometry.lambda_ratio:.3f}",
             "",
             f"Режим работы:",
-            f"  n = {self.operating.n:.1f} об/мин",
+            f"  n = {self.operating.n_rpm:.1f} об/мин",
             f"  ω = {self.operating.omega:.2f} рад/с",
-            f"  U = {self.U:.3f} м/с",
-            f"  ε = {self.operating.epsilon:.2f}",
+            f"  U = {U:.3f} м/с",
             "",
-            f"Смазка при T = {self.operating.T_inlet}°C:",
+            f"Смазка при T = {T}°C:",
             f"  η = {eta*1000:.3f} мПа·с",
-            f"  ρ = {self.lubricant.rho:.0f} кг/м³",
+            f"  η̂ = {self.lubricant.eta_hat(T):.4f}",
             "",
-            f"Масштабы:",
-            f"  Давление: {self.pressure_scale/1e6:.3f} МПа",
-            f"  Нагрузка: {self.load_scale:.1f} Н",
+            f"Масштабы при T = {T}°C:",
+            f"  p0 = {self.pressure_scale(T)/1e6:.3f} МПа",
+            f"  F_scale = {self.force_scale(T):.1f} Н",
+            f"  K_scale = {self.K_scale(T)/1e6:.3f} МН/м",
+            f"  C_scale = {self.C_scale(T)/1e3:.3f} кН·с/м",
             "",
             f"Текстура: {'Да' if self.texture.enabled else 'Нет'}",
+            f"  Филлотаксис: {'Да' if self.texture.use_phyllotaxis else 'Нет'}",
             "=" * 50,
         ]
         return "\n".join(lines)
 
 
-# Пресеты для разных применений
-def create_roller_cone_bit_bearing(
-    n_rpm: float = 150.0,
-    T_inlet: float = 80.0,
+def create_chinese_paper_bearing(
+    n_rpm: float = 100.0,
+    T_operating: float = 80.0,
 ) -> BearingModel:
     """
-    Параметры для опоры шарошечного долота.
+    Создать модель подшипника по данным китайской статьи.
 
-    Особенности:
-    - Скорость вращения 100-200 об/мин (зависит от режима бурения)
-    - Высокая температура забоя (растёт с глубиной ~30°C/км)
-    - Малый зазор для гидродинамического эффекта
-
-    Args:
-        n_rpm: скорость вращения (об/мин)
-        T_inlet: температура забоя (°C)
+    D_B = 83 мм, D_J = 82.5 мм, L = 45 мм
+    c0 = (83 - 82.5)/2 = 0.25 мм = 250 мкм
     """
+    geometry = BearingGeometry(
+        R_J=82.5e-3 / 2,    # 41.25 мм
+        R_B=83e-3 / 2,      # 41.5 мм
+        L=45e-3,            # 45 мм
+    )
+
+    texture = TextureParameters(
+        enabled=True,
+        h_p=20e-6,              # 20 мкм глубина
+        a=2e-3,                 # 2 мм полуось по z
+        b=2e-3,                 # 2 мм полуось по φ
+        use_phyllotaxis=True,
+        T_spirals=10,           # 10 спиралей
+        alpha_step_deg=12,      # 12° угловой шаг
+        c_step=5e-3,            # 5 мм шаг по высоте
+        phi_min=np.pi/2,        # 90°
+        phi_max=3*np.pi/2,      # 270°
+    )
+
+    material = MaterialProperties(
+        alpha_J=12e-6,          # Сталь
+        alpha_B=18e-6,          # Бронза
+        T_ref=20.0,
+    )
+
+    lubricant = LubricantProperties(
+        eta_ref=0.05,           # 50 мПа·с при 40°C
+        beta_eta=0.03,          # Типичное значение для минеральных масел
+        T_ref=40.0,
+        rho=870.0,
+        c_p=2000.0,
+    )
+
+    operating = OperatingConditions(
+        n_rpm=n_rpm,
+        W_min=500.0,            # 500 Н
+        W_max=10000.0,          # 10 кН
+        T_min=40.0,
+        T_max=120.0,
+        N_W=20,
+        N_T=15,
+    )
+
+    numerical = NumericalSettings(
+        N_phi=360,
+        N_Z=100,
+        tol_Re=1e-6,
+        max_iter_Re=10000,
+        omega_GS=1.7,
+        use_cavitation=True,
+        delta_xi=1e-4,
+        delta_xi_dot=1e-4,
+    )
+
     return BearingModel(
-        geometry=BearingGeometry(
-            R=0.025,        # 25 мм — радиус цапфы шарошки
-            c=0.00005,      # 50 мкм — малый зазор для гидродинамики!
-            L=0.030,        # 30 мм — длина опоры
-        ),
-        texture=TextureParameters(
-            enabled=True,
-            h_p=0.000015,   # 15 мкм — глубина углублений (30% от зазора)
-            a=0.0012,       # полуось по Z
-            b=0.0010,       # полуось по φ
-            N_phi=8,        # углублений по окружности
-            N_Z=6,          # углублений по длине
-            phi_start_deg=90.0,   # Зона текстуры: 90° - 270°
-            phi_end_deg=270.0,
-        ),
-        lubricant=LubricantProperties(
-            eta_0=0.05,         # 50 мПа·с при 40°C — вязкое масло для долот
-            T_0=40.0,
-            beta=0.028,         # температурный коэффициент
-            rho=880.0,
-            c_p=2100.0,
-            k=0.13,
-        ),
-        operating=OperatingConditions(
-            n=n_rpm,
-            epsilon=0.6,
-            T_inlet=T_inlet,
-            T_ambient=T_inlet + 20.0,
-        ),
-        grid=GridParameters(
-            num_phi=360,
-            num_Z=100,
-        ),
+        geometry=geometry,
+        texture=texture,
+        material=material,
+        lubricant=lubricant,
+        operating=operating,
+        numerical=numerical,
     )
 
 
-def create_test_bearing() -> BearingModel:
-    """Тестовые параметры из исходного кода."""
+def create_roller_cone_bit_bearing(
+    n_rpm: float = 150.0,
+    T_operating: float = 80.0,
+) -> BearingModel:
+    """
+    Создать модель подшипника шарошечного долота.
+
+    Типичные параметры для опоры шарошечного долота.
+    """
+    geometry = BearingGeometry(
+        R_J=25e-3,          # 25 мм радиус шейки
+        R_B=25.05e-3,       # 25.05 мм радиус вкладыша (зазор 50 мкм)
+        L=30e-3,            # 30 мм длина
+    )
+
+    texture = TextureParameters(
+        enabled=True,
+        h_p=15e-6,              # 15 мкм глубина
+        a=1.5e-3,               # 1.5 мм полуось по z
+        b=1.5e-3,               # 1.5 мм полуось по φ
+        use_phyllotaxis=True,
+        T_spirals=8,
+        alpha_step_deg=15,
+        c_step=4e-3,
+        phi_min=np.pi/2,
+        phi_max=3*np.pi/2,
+    )
+
+    material = MaterialProperties(
+        alpha_J=12e-6,
+        alpha_B=18e-6,
+        T_ref=20.0,
+    )
+
+    lubricant = LubricantProperties(
+        eta_ref=0.05,
+        beta_eta=0.025,
+        T_ref=40.0,
+        rho=870.0,
+        c_p=2000.0,
+    )
+
+    operating = OperatingConditions(
+        n_rpm=n_rpm,
+        W_min=100.0,
+        W_max=5000.0,
+        T_min=40.0,
+        T_max=120.0,
+        N_W=20,
+        N_T=15,
+    )
+
+    numerical = NumericalSettings(
+        N_phi=360,
+        N_Z=100,
+        tol_Re=1e-6,
+        max_iter_Re=10000,
+        omega_GS=1.7,
+        use_cavitation=True,
+        delta_xi=1e-4,
+        delta_xi_dot=1e-4,
+    )
+
     return BearingModel(
-        geometry=BearingGeometry(R=0.035, c=0.0005, L=0.056),
-        texture=TextureParameters(
-            enabled=True,
-            h_p=0.0001,
-            a=0.00241,
-            b=0.002214,
-            N_phi=8,
-            N_Z=11,
-        ),
-        lubricant=LubricantProperties(eta_0=0.01105, T_0=40.0, beta=0.03),
-        operating=OperatingConditions(n=2980.0, epsilon=0.6, T_inlet=40.0),
-        grid=GridParameters(num_phi=500, num_Z=500),
+        geometry=geometry,
+        texture=texture,
+        material=material,
+        lubricant=lubricant,
+        operating=operating,
+        numerical=numerical,
     )
 
 
 if __name__ == "__main__":
     # Тест
-    model = create_roller_cone_bit_bearing()
-    print(model.info())
+    model = create_chinese_paper_bearing()
+    print(model.info(T=80.0))
 
-    # Проверка температурной зависимости вязкости
     print("\nЗависимость вязкости от температуры:")
     for T in [40, 60, 80, 100, 120]:
         eta = model.lubricant.viscosity(T)
-        print(f"  T = {T}°C: η = {eta*1000:.3f} мПа·с")
+        eta_hat = model.lubricant.eta_hat(T)
+        print(f"  T = {T}°C: η = {eta*1000:.3f} мПа·с, η̂ = {eta_hat:.4f}")
+
+    print("\nИзменение зазора от температуры:")
+    for T in [40, 60, 80, 100, 120]:
+        H_T = model.material.H_T(model.geometry, T)
+        delta_c = model.material.clearance_change(model.geometry, T)
+        print(f"  T = {T}°C: Δc = {delta_c*1e6:.2f} мкм, H_T = {H_T:.4f}")

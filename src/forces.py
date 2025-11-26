@@ -1,109 +1,124 @@
 """
-Вычисление сил, нагрузок и динамических коэффициентов подшипника.
+Вычисление сил, нагрузок и коэффициентов жёсткости/демпфирования.
 
-Система координат:
-- x: вдоль линии центров (от втулки к валу), φ=0
-- y: перпендикулярно x, в направлении вращения, φ=π/2
+Система координат (из постановки задачи):
+- ось x по линии минимального зазора
+- ось y перпендикулярна x
+- нагрузка W направлена по оси y
 
-Силы от давления:
-    Fx = -∫∫ P·cos(φ) dφ dZ  (минус, т.к. давление действует на вал внутрь)
-    Fy = -∫∫ P·sin(φ) dφ dZ
+Безразмерные силы:
+    Fx* = ∫∫ P(φ,Z)·cos(φ) dφ dZ
+    Fy* = ∫∫ P(φ,Z)·sin(φ) dφ dZ
 
-Коэффициенты жёсткости (статические):
-    Kxx = -∂Fx/∂x,  Kxy = -∂Fx/∂y
-    Kyx = -∂Fy/∂x,  Kyy = -∂Fy/∂y
+Размерный масштаб:
+    F_scale = p₀·R_J·L = 6η_ref·U·R_J²·L / c₀²
 
-Коэффициенты демпфирования (динамические):
-    Cxx = -∂Fx/∂ẋ,  Cxy = -∂Fx/∂ẏ
-    Cyx = -∂Fy/∂ẋ,  Cyy = -∂Fy/∂ẏ
+Коэффициенты жёсткости (конечные разности):
+    K_xx = -(F_x⁺ - F_x⁻) / (2Δx)
+    K_yx = -(F_y⁺ - F_y⁻) / (2Δx)
+    где Δx = Δξ·c₀
 
-Все коэффициенты вычисляются численным дифференцированием.
+Коэффициенты демпфирования (через squeeze-член):
+    C_xx = -(F_x^{+ẋ} - F_x^{-ẋ}) / (2Δẋ)
+    где Δẋ = Δξ'·c₀·ω
+
+Безразмерные масштабы:
+    K_scale = η·ω·L / ψ³
+    C_scale = η·L / ψ³
 """
 
 import numpy as np
 from typing import Tuple, Dict, Optional
 from dataclasses import dataclass
-from joblib import Parallel, delayed
+from scipy.optimize import brentq
 
-from .geometry import Grid, compute_film_thickness, compute_film_thickness_dynamic
-from .reynolds import ReynoldsSolver, solve_reynolds_static, solve_reynolds_dynamic, compute_dH_dt
-from .parameters import BearingModel
+from .geometry import (
+    Grid, create_grid,
+    compute_film_thickness_static,
+    compute_film_thickness_full,
+    compute_dH_dtau,
+)
+from .reynolds import ReynoldsSolver, solve_reynolds_static, solve_reynolds_with_squeeze
+from .parameters import BearingModel, BearingGeometry, TextureParameters
 
 
 @dataclass
 class ForceResult:
     """Результат вычисления сил."""
-    Fx: float               # Сила по x (Н)
-    Fy: float               # Сила по y (Н)
-    F_total: float          # Полная сила (Н)
-    attitude_angle: float   # Угол нагрузки (рад)
+    Fx: float               # Сила по x (Н) — размерная
+    Fy: float               # Сила по y (Н) — размерная
+    Fx_star: float          # Безразмерная сила по x
+    Fy_star: float          # Безразмерная сила по y
 
 
 @dataclass
 class FrictionResult:
     """Результат вычисления трения."""
     friction_force: float   # Сила трения (Н)
-    friction_coeff: float   # Коэффициент трения μ
-    power_loss: float       # Потери мощности (Вт)
+    friction_coeff: float   # Коэффициент трения μ_f
+    power_loss: float       # Мощность потерь N_f (Вт)
 
 
 @dataclass
-class DynamicCoefficients:
-    """Динамические коэффициенты подшипника."""
-    # Жёсткость (Н/м)
-    Kxx: float
-    Kxy: float
-    Kyx: float
-    Kyy: float
-    # Демпфирование (Н·с/м)
-    Cxx: float
-    Cxy: float
-    Cyx: float
-    Cyy: float
+class StiffnessCoefficients:
+    """Коэффициенты жёсткости."""
+    K_xx: float     # Н/м
+    K_xy: float
+    K_yx: float
+    K_yy: float
+    # Безразмерные
+    K_xx_bar: float
+    K_xy_bar: float
+    K_yx_bar: float
+    K_yy_bar: float
+
+
+@dataclass
+class DampingCoefficients:
+    """Коэффициенты демпфирования."""
+    C_xx: float     # Н·с/м
+    C_xy: float
+    C_yx: float
+    C_yy: float
+    # Безразмерные
+    C_xx_bar: float
+    C_xy_bar: float
+    C_yx_bar: float
+    C_yy_bar: float
 
 
 def integrate_forces(
     P: np.ndarray,
     grid: Grid,
-    pressure_scale: float,
-    R: float,
-    L: float,
+    force_scale: float,
 ) -> ForceResult:
     """
     Интегрирование давления для получения сил.
 
-    Fx = -∫∫ P·cos(φ) · R·dφ · (L/2)·dZ
-    Fy = -∫∫ P·sin(φ) · R·dφ · (L/2)·dZ
+    Fx* = ∫_{-1}^{1} ∫_0^{2π} P(φ,Z)·cos(φ) dφ dZ
+    Fy* = ∫_{-1}^{1} ∫_0^{2π} P(φ,Z)·sin(φ) dφ dZ
 
     Args:
-        P: безразмерное давление
+        P: безразмерное давление (N_Z x N_phi)
         grid: расчётная сетка
-        pressure_scale: масштаб давления (Па)
-        R: радиус (м)
-        L: длина (м)
+        force_scale: F_scale = p₀·R_J·L
 
     Returns:
-        ForceResult с размерными силами
+        ForceResult с размерными и безразмерными силами
     """
-    # Безразмерные интегралы (минус учитывает направление силы на вал)
-    Fx_nd = -np.trapz(np.trapz(P * grid.cos_phi, grid.phi, axis=1), grid.Z)
-    Fy_nd = -np.trapz(np.trapz(P * grid.sin_phi, grid.phi, axis=1), grid.Z)
+    # Безразмерные интегралы
+    Fx_star = np.trapz(np.trapz(P * grid.cos_phi, grid.phi, axis=1), grid.Z)
+    Fy_star = np.trapz(np.trapz(P * grid.sin_phi, grid.phi, axis=1), grid.Z)
 
-    # Масштабирование к размерным величинам
-    # ∫dφ даёт ~2π, ∫dZ даёт 2, площадь R·L/2
-    force_scale = pressure_scale * R * L / 2
-
-    Fx = Fx_nd * force_scale
-    Fy = Fy_nd * force_scale
-
-    F_total = np.sqrt(Fx**2 + Fy**2)
-    attitude_angle = np.arctan2(Fy, Fx)
+    # Размерные силы
+    Fx = Fx_star * force_scale
+    Fy = Fy_star * force_scale
 
     return ForceResult(
         Fx=Fx,
         Fy=Fy,
-        F_total=F_total,
-        attitude_angle=attitude_angle
+        Fx_star=Fx_star,
+        Fy_star=Fy_star
     )
 
 
@@ -112,57 +127,60 @@ def compute_friction(
     H: np.ndarray,
     grid: Grid,
     model: BearingModel,
+    T: float,
 ) -> FrictionResult:
     """
-    Вычисление силы трения на валу.
+    Вычисление силы трения.
 
-    Касательное напряжение на поверхности вала:
-        τ = η·U/h - (h/2)·∂P/∂x
+    Интеграл силы трения:
+        I = 1/H + 3H·∂P/∂φ
+        f = ∫∫ I dφ dZ
 
-    Сила трения:
-        F_f = ∫∫ τ · R·dφ · dz
+    Коэффициент трения:
+        μ_f = f / W
 
-    В безразмерной форме:
-        f = ∫∫ (1/H + (H/2)·∂P/∂φ) dφ dZ
+    Мощность потерь:
+        N_f = f · U
 
     Args:
         P: безразмерное давление
         H: безразмерная толщина
         grid: расчётная сетка
         model: параметры подшипника
+        T: температура (°C)
 
     Returns:
         FrictionResult
     """
-    # Производная давления по φ
+    # ∂P/∂φ
     dP_dphi = np.zeros_like(P)
-    dP_dphi[:, 1:-1] = (P[:, 2:] - P[:, :-2]) / (2 * grid.d_phi)
-    dP_dphi[:, 0] = (P[:, 1] - P[:, -2]) / (2 * grid.d_phi)
-    dP_dphi[:, -1] = dP_dphi[:, 0]
+    for i in range(grid.N_Z):
+        for j in range(grid.N_phi):
+            j_plus = (j + 1) % grid.N_phi
+            j_minus = (j - 1) % grid.N_phi
+            dP_dphi[i, j] = (P[i, j_plus] - P[i, j_minus]) / (2 * grid.d_phi)
 
-    # Безразмерный интеграл для силы трения
-    # Первый член (Couette): 1/H
-    # Второй член (Poiseuille): коррекция от градиента давления
-    integrand = 1.0 / H - 0.5 * H * dP_dphi
-
-    f_nd = np.trapz(np.trapz(integrand, grid.phi, axis=1), grid.Z)
+    # Интеграл трения (безразмерный)
+    # I = 1/H + 3H·∂P/∂φ  (формула из постановки)
+    integrand = 1.0 / H + 3.0 * H * dP_dphi
+    f_star = np.trapz(np.trapz(integrand, grid.phi, axis=1), grid.Z)
 
     # Масштаб силы трения
-    eta = model.lubricant.viscosity(model.operating.T_inlet)
-    friction_scale = eta * model.U * model.geometry.R * model.geometry.L / model.geometry.c
+    eta = model.lubricant.viscosity(T)
+    U = model.operating.U(model.geometry.R_J)
+    friction_scale = eta * U * model.geometry.R_J * model.geometry.L / model.geometry.c0
 
-    friction_force = f_nd * friction_scale
+    friction_force = f_star * friction_scale
 
-    # Коэффициент трения (нужна несущая способность)
-    # Вычисляем силы для определения нагрузки
-    forces = integrate_forces(
-        P, grid, model.pressure_scale, model.geometry.R, model.geometry.L
-    )
+    # Для коэффициента трения нужна нагрузка — получим из сил
+    force_scale = model.force_scale(T)
+    forces = integrate_forces(P, grid, force_scale)
+    W = np.sqrt(forces.Fx**2 + forces.Fy**2)
 
-    friction_coeff = abs(friction_force / forces.F_total) if forces.F_total > 0 else 0.0
+    friction_coeff = abs(friction_force / W) if W > 1e-12 else 0.0
 
-    # Потери мощности
-    power_loss = friction_force * model.U
+    # Мощность потерь
+    power_loss = abs(friction_force) * U
 
     return FrictionResult(
         friction_force=friction_force,
@@ -171,363 +189,331 @@ def compute_friction(
     )
 
 
-def compute_stiffness_coefficients(
+def find_equilibrium_eccentricity(
+    W_target: float,
+    T: float,
     model: BearingModel,
     grid: Grid,
-    epsilon: float,
-    delta_eps: float = 1e-5,
     with_texture: bool = True,
-    n_jobs: int = 4,
-) -> Tuple[float, float, float, float]:
+    eps_min: float = 0.01,
+    eps_max: float = 0.95,
+    tol: float = 1e-3,
+) -> Tuple[float, ForceResult]:
+    """
+    Поиск статического эксцентриситета ε₀(W, T) из условия равновесия.
+
+    Условие: F_y(ε₀, T) = W, F_x(ε₀, T) ≈ 0
+
+    Алгоритм:
+    1. Задаём T → вычисляем η̂(T) и H_T(T)
+    2. Методом деления отрезка ищем ε₀ такой что |F_y - W| < tol
+
+    Args:
+        W_target: целевая нагрузка (Н)
+        T: температура (°C)
+        model: параметры подшипника
+        grid: расчётная сетка
+        with_texture: учитывать текстуру
+        eps_min, eps_max: диапазон поиска ε₀
+        tol: допуск по нагрузке (относительный)
+
+    Returns:
+        (epsilon_0, ForceResult)
+    """
+    eta_hat = model.lubricant.eta_hat(T)
+    H_T = model.material.H_T(model.geometry, T)
+    force_scale = model.force_scale(T)
+    lambda_sq = model.geometry.lambda_ratio ** 2
+
+    texture = model.texture if with_texture else None
+
+    def residual(epsilon_0: float) -> float:
+        """Невязка: F_y - W."""
+        H = compute_film_thickness_static(
+            grid, model.geometry, epsilon_0, texture, H_T
+        )
+
+        P, _, _ = solve_reynolds_static(
+            H, eta_hat,
+            grid.d_phi, grid.d_Z, lambda_sq,
+            omega_sor=model.numerical.omega_GS,
+            tol=model.numerical.tol_Re,
+            max_iter=model.numerical.max_iter_Re,
+            use_cavitation=model.numerical.use_cavitation
+        )
+
+        forces = integrate_forces(P, grid, force_scale)
+        return forces.Fy - W_target
+
+    # Проверяем границы
+    r_min = residual(eps_min)
+    r_max = residual(eps_max)
+
+    # Если знаки одинаковые, расширяем диапазон или возвращаем границу
+    if r_min * r_max > 0:
+        if abs(r_min) < abs(r_max):
+            epsilon_0 = eps_min
+        else:
+            epsilon_0 = eps_max
+    else:
+        # Метод Брента для поиска корня
+        epsilon_0 = brentq(residual, eps_min, eps_max, xtol=1e-4)
+
+    # Вычисляем силы при найденном ε₀
+    H = compute_film_thickness_static(
+        grid, model.geometry, epsilon_0, texture, H_T
+    )
+    P, _, _ = solve_reynolds_static(
+        H, eta_hat,
+        grid.d_phi, grid.d_Z, lambda_sq,
+        omega_sor=model.numerical.omega_GS,
+        tol=model.numerical.tol_Re,
+        max_iter=model.numerical.max_iter_Re,
+        use_cavitation=model.numerical.use_cavitation
+    )
+    forces = integrate_forces(P, grid, force_scale)
+
+    return epsilon_0, forces
+
+
+def compute_stiffness_coefficients(
+    epsilon_0: float,
+    T: float,
+    model: BearingModel,
+    grid: Grid,
+    with_texture: bool = True,
+) -> StiffnessCoefficients:
     """
     Вычисление коэффициентов жёсткости методом конечных разностей.
 
-    Kij = -∂Fi/∂xj ≈ -(Fi(xj+Δ) - Fi(xj-Δ)) / (2Δ)
+    Из постановки задачи:
+        K_xx = -(F_x⁺ - F_x⁻) / (2Δx),  где ξ = +Δξ и ξ = -Δξ
+        K_yx = -(F_y⁺ - F_y⁻) / (2Δx)
+        Δx = Δξ · c₀
+
+    Для K_xy, K_yy аналогично со смещением по η.
 
     Args:
+        epsilon_0: статический эксцентриситет
+        T: температура (°C)
         model: параметры подшипника
         grid: расчётная сетка
-        epsilon: базовый эксцентриситет
-        delta_eps: шаг для численного дифференцирования
         with_texture: учитывать текстуру
-        n_jobs: число параллельных задач
 
     Returns:
-        Kxx, Kxy, Kyx, Kyy (Н/м)
+        StiffnessCoefficients
     """
-    D_over_L = model.geometry.D / model.geometry.L
+    delta_xi = model.numerical.delta_xi
+    eta_hat = model.lubricant.eta_hat(T)
+    H_T = model.material.H_T(model.geometry, T)
+    force_scale = model.force_scale(T)
+    lambda_sq = model.geometry.lambda_ratio ** 2
     texture = model.texture if with_texture else None
 
-    def solve_and_get_forces(eps_x: float, eps_y: float) -> Tuple[float, float]:
-        """Решить Reynolds и вернуть силы."""
-        H = compute_film_thickness_dynamic(grid, model.geometry, eps_x, eps_y, texture)
+    def get_forces(xi: float, eta: float) -> Tuple[float, float]:
+        """Вычислить силы при смещении (ξ, η)."""
+        H = compute_film_thickness_full(
+            grid, model.geometry, epsilon_0, xi, eta, texture, H_T
+        )
         P, _, _ = solve_reynolds_static(
-            H, grid.d_phi, grid.d_Z, D_over_L,
-            omega_sor=1.5, tol=1e-6, max_iter=50000
+            H, eta_hat,
+            grid.d_phi, grid.d_Z, lambda_sq,
+            omega_sor=model.numerical.omega_GS,
+            tol=model.numerical.tol_Re,
+            max_iter=model.numerical.max_iter_Re,
+            use_cavitation=model.numerical.use_cavitation
         )
-        forces = integrate_forces(
-            P, grid, model.pressure_scale, model.geometry.R, model.geometry.L
-        )
+        forces = integrate_forces(P, grid, force_scale)
         return forces.Fx, forces.Fy
 
-    # Возмущения по x (εx)
-    eps_x_plus = epsilon + delta_eps
-    eps_x_minus = epsilon - delta_eps
+    # Смещение по x (ξ)
+    Fx_plus_x, Fy_plus_x = get_forces(+delta_xi, 0.0)
+    Fx_minus_x, Fy_minus_x = get_forces(-delta_xi, 0.0)
 
-    # Возмущения по y (εy)
-    eps_y_plus = delta_eps
-    eps_y_minus = -delta_eps
+    # Смещение по y (η)
+    Fx_plus_y, Fy_plus_y = get_forces(0.0, +delta_xi)
+    Fx_minus_y, Fy_minus_y = get_forces(0.0, -delta_xi)
 
-    # Параллельное вычисление
-    tasks = [
-        (eps_x_plus, 0.0),   # +Δx
-        (eps_x_minus, 0.0),  # -Δx
-        (epsilon, eps_y_plus),   # +Δy
-        (epsilon, eps_y_minus),  # -Δy
-    ]
+    # Размерный шаг
+    delta_x = delta_xi * model.geometry.c0
 
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(solve_and_get_forces)(ex, ey) for ex, ey in tasks
+    # Коэффициенты жёсткости (размерные)
+    K_xx = -(Fx_plus_x - Fx_minus_x) / (2 * delta_x)
+    K_yx = -(Fy_plus_x - Fy_minus_x) / (2 * delta_x)
+    K_xy = -(Fx_plus_y - Fx_minus_y) / (2 * delta_x)
+    K_yy = -(Fy_plus_y - Fy_minus_y) / (2 * delta_x)
+
+    # Масштаб для безразмерных коэффициентов
+    K_scale = model.K_scale(T)
+
+    return StiffnessCoefficients(
+        K_xx=K_xx, K_xy=K_xy, K_yx=K_yx, K_yy=K_yy,
+        K_xx_bar=K_xx / K_scale,
+        K_xy_bar=K_xy / K_scale,
+        K_yx_bar=K_yx / K_scale,
+        K_yy_bar=K_yy / K_scale,
     )
-
-    Fx_px, Fy_px = results[0]  # +Δx
-    Fx_mx, Fy_mx = results[1]  # -Δx
-    Fx_py, Fy_py = results[2]  # +Δy
-    Fx_my, Fy_my = results[3]  # -Δy
-
-    # Производные (с учётом перехода от ε к x: x = ε·c)
-    c = model.geometry.c
-    delta_x = delta_eps * c
-
-    Kxx = -(Fx_px - Fx_mx) / (2 * delta_x)
-    Kyx = -(Fy_px - Fy_mx) / (2 * delta_x)
-    Kxy = -(Fx_py - Fx_my) / (2 * delta_x)
-    Kyy = -(Fy_py - Fy_my) / (2 * delta_x)
-
-    return Kxx, Kxy, Kyx, Kyy
 
 
 def compute_damping_coefficients(
+    epsilon_0: float,
+    T: float,
     model: BearingModel,
     grid: Grid,
-    epsilon: float,
-    delta_eps_dot: float = 1e-5,
     with_texture: bool = True,
-    n_jobs: int = 4,
-) -> Tuple[float, float, float, float]:
+) -> DampingCoefficients:
     """
-    Вычисление коэффициентов демпфирования.
+    Вычисление коэффициентов демпфирования через squeeze-член.
 
-    Cij = -∂Fi/∂ẋj
+    Из постановки задачи:
+        В уравнение Рейнольдса входит ∂H/∂τ = ξ'·cos(φ) + η'·sin(φ)
+        где ξ' = ẋ/(c₀·ω), η' = ẏ/(c₀·ω)
 
-    Используется динамическое уравнение Рейнольдса с ∂H/∂t.
+        C_xx = -(F_x^{+ẋ} - F_x^{-ẋ}) / (2Δẋ)
+        Δẋ = Δξ' · c₀ · ω
 
     Args:
+        epsilon_0: статический эксцентриситет
+        T: температура (°C)
         model: параметры подшипника
         grid: расчётная сетка
-        epsilon: базовый эксцентриситет
-        delta_eps_dot: шаг по скорости
         with_texture: учитывать текстуру
-        n_jobs: число параллельных задач
 
     Returns:
-        Cxx, Cxy, Cyx, Cyy (Н·с/м)
+        DampingCoefficients
     """
-    D_over_L = model.geometry.D / model.geometry.L
+    delta_xi_dot = model.numerical.delta_xi_dot
+    eta_hat = model.lubricant.eta_hat(T)
+    H_T = model.material.H_T(model.geometry, T)
+    force_scale = model.force_scale(T)
+    lambda_sq = model.geometry.lambda_ratio ** 2
     texture = model.texture if with_texture else None
 
-    # Базовый зазор
-    H = compute_film_thickness_dynamic(grid, model.geometry, epsilon, 0.0, texture)
+    # Базовый зазор (при статическом положении)
+    H = compute_film_thickness_static(
+        grid, model.geometry, epsilon_0, texture, H_T
+    )
 
-    def solve_dynamic_and_get_forces(eps_x_dot: float, eps_y_dot: float) -> Tuple[float, float]:
-        """Решить динамический Reynolds и вернуть силы."""
-        dH_dt = compute_dH_dt(grid, eps_x_dot, eps_y_dot)
+    def get_forces_squeeze(xi_dot: float, eta_dot: float) -> Tuple[float, float]:
+        """Вычислить силы при скорости (ξ', η')."""
+        dH_dtau = compute_dH_dtau(grid, xi_dot, eta_dot)
 
-        P, _, _ = solve_reynolds_dynamic(
-            H, dH_dt, grid.d_phi, grid.d_Z, D_over_L,
-            omega_sor=1.5, tol=1e-6, max_iter=50000
+        P, _, _ = solve_reynolds_with_squeeze(
+            H, dH_dtau, eta_hat,
+            grid.d_phi, grid.d_Z, lambda_sq,
+            beta=2.0,
+            omega_sor=model.numerical.omega_GS,
+            tol=model.numerical.tol_Re,
+            max_iter=model.numerical.max_iter_Re,
+            use_cavitation=model.numerical.use_cavitation
         )
-
-        forces = integrate_forces(
-            P, grid, model.pressure_scale, model.geometry.R, model.geometry.L
-        )
+        forces = integrate_forces(P, grid, force_scale)
         return forces.Fx, forces.Fy
 
-    # Возмущения по скоростям
-    tasks = [
-        (+delta_eps_dot, 0.0),  # +ẋ
-        (-delta_eps_dot, 0.0),  # -ẋ
-        (0.0, +delta_eps_dot),  # +ẏ
-        (0.0, -delta_eps_dot),  # -ẏ
-    ]
+    # Смещение скорости по x (ξ')
+    Fx_plus_xdot, Fy_plus_xdot = get_forces_squeeze(+delta_xi_dot, 0.0)
+    Fx_minus_xdot, Fy_minus_xdot = get_forces_squeeze(-delta_xi_dot, 0.0)
 
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(solve_dynamic_and_get_forces)(vx, vy) for vx, vy in tasks
+    # Смещение скорости по y (η')
+    Fx_plus_ydot, Fy_plus_ydot = get_forces_squeeze(0.0, +delta_xi_dot)
+    Fx_minus_ydot, Fy_minus_ydot = get_forces_squeeze(0.0, -delta_xi_dot)
+
+    # Размерный шаг скорости
+    delta_x_dot = delta_xi_dot * model.geometry.c0 * model.operating.omega
+
+    # Коэффициенты демпфирования (размерные)
+    C_xx = -(Fx_plus_xdot - Fx_minus_xdot) / (2 * delta_x_dot)
+    C_yx = -(Fy_plus_xdot - Fy_minus_xdot) / (2 * delta_x_dot)
+    C_xy = -(Fx_plus_ydot - Fx_minus_ydot) / (2 * delta_x_dot)
+    C_yy = -(Fy_plus_ydot - Fy_minus_ydot) / (2 * delta_x_dot)
+
+    # Масштаб для безразмерных коэффициентов
+    C_scale = model.C_scale(T)
+
+    return DampingCoefficients(
+        C_xx=C_xx, C_xy=C_xy, C_yx=C_yx, C_yy=C_yy,
+        C_xx_bar=C_xx / C_scale,
+        C_xy_bar=C_xy / C_scale,
+        C_yx_bar=C_yx / C_scale,
+        C_yy_bar=C_yy / C_scale,
     )
 
-    Fx_pvx, Fy_pvx = results[0]
-    Fx_mvx, Fy_mvx = results[1]
-    Fx_pvy, Fy_pvy = results[2]
-    Fx_mvy, Fy_mvy = results[3]
 
-    # Производные
-    # Скорость: ẋ = ε̇·c, но в безразмерной форме ε̇ = ẋ/(c·ω)
-    # Поэтому масштаб: delta_v = delta_eps_dot * c * omega
-    c = model.geometry.c
-    omega = model.operating.omega
-    delta_v = delta_eps_dot * c * omega
-
-    Cxx = -(Fx_pvx - Fx_mvx) / (2 * delta_v)
-    Cyx = -(Fy_pvx - Fy_mvx) / (2 * delta_v)
-    Cxy = -(Fx_pvy - Fx_mvy) / (2 * delta_v)
-    Cyy = -(Fy_pvy - Fy_mvy) / (2 * delta_v)
-
-    return Cxx, Cxy, Cyx, Cyy
+@dataclass
+class FullCoefficients:
+    """Полный набор коэффициентов K и C."""
+    stiffness: StiffnessCoefficients
+    damping: DampingCoefficients
 
 
-def compute_all_dynamic_coefficients(
+def compute_all_coefficients(
+    epsilon_0: float,
+    T: float,
     model: BearingModel,
     grid: Grid,
-    epsilon: float,
-    delta_eps: float = 1e-5,
-    delta_eps_dot: float = 1e-5,
     with_texture: bool = True,
-    n_jobs: int = 8,
-) -> DynamicCoefficients:
+) -> FullCoefficients:
     """
-    Вычисление всех 8 динамических коэффициентов.
+    Вычисление всех 8 коэффициентов K_ij и C_ij.
 
     Args:
+        epsilon_0: статический эксцентриситет
+        T: температура (°C)
         model: параметры подшипника
         grid: расчётная сетка
-        epsilon: эксцентриситет
-        delta_eps: шаг для жёсткости
-        delta_eps_dot: шаг для демпфирования
         with_texture: учитывать текстуру
-        n_jobs: число параллельных задач
 
     Returns:
-        DynamicCoefficients
+        FullCoefficients
     """
-    # Жёсткость
-    Kxx, Kxy, Kyx, Kyy = compute_stiffness_coefficients(
-        model, grid, epsilon, delta_eps, with_texture, n_jobs // 2
+    stiffness = compute_stiffness_coefficients(
+        epsilon_0, T, model, grid, with_texture
+    )
+    damping = compute_damping_coefficients(
+        epsilon_0, T, model, grid, with_texture
     )
 
-    # Демпфирование
-    Cxx, Cxy, Cyx, Cyy = compute_damping_coefficients(
-        model, grid, epsilon, delta_eps_dot, with_texture, n_jobs // 2
-    )
-
-    return DynamicCoefficients(
-        Kxx=Kxx, Kxy=Kxy, Kyx=Kyx, Kyy=Kyy,
-        Cxx=Cxx, Cxy=Cxy, Cyx=Cyx, Cyy=Cyy
-    )
-
-
-def compute_stability_parameters(coeff: DynamicCoefficients) -> Dict[str, float]:
-    """
-    Вычисление параметров устойчивости ротора.
-
-    Эквивалентная жёсткость:
-        K_eq = (Kxx·Cyy + Kyy·Cxx - Kxy·Cyx - Kyx·Cxy) / (Cxx + Cyy)
-
-    Параметр устойчивости:
-        γ² = (K_eq - Kxx)(K_eq - Kyy) - Kxy·Kyx) / (Cxx·Cyy - Cxy·Cyx)
-
-    Критическая скорость:
-        ω_st = K_eq / γ²
-
-    Args:
-        coeff: динамические коэффициенты
-
-    Returns:
-        Словарь с K_eq, gamma_sq, omega_st
-    """
-    Kxx, Kxy, Kyx, Kyy = coeff.Kxx, coeff.Kxy, coeff.Kyx, coeff.Kyy
-    Cxx, Cxy, Cyx, Cyy = coeff.Cxx, coeff.Cxy, coeff.Cyx, coeff.Cyy
-
-    # Эквивалентная жёсткость
-    denom = Cxx + Cyy
-    if abs(denom) < 1e-12:
-        K_eq = 0.0
-    else:
-        K_eq = (Kxx * Cyy + Kyy * Cxx - Kxy * Cyx - Kyx * Cxy) / denom
-
-    # Параметр устойчивости γ²
-    num = (K_eq - Kxx) * (K_eq - Kyy) - Kxy * Kyx
-    det_C = Cxx * Cyy - Cxy * Cyx
-    if abs(det_C) < 1e-12:
-        gamma_sq = 0.0
-    else:
-        gamma_sq = num / det_C
-
-    # Критическая скорость
-    if abs(gamma_sq) < 1e-12:
-        omega_st = 0.0
-    else:
-        omega_st = K_eq / gamma_sq
-
-    return {
-        "K_eq": K_eq,
-        "gamma_sq": gamma_sq,
-        "omega_st": omega_st
-    }
-
-
-class BearingAnalyzer:
-    """
-    Комплексный анализатор подшипника.
-
-    Объединяет вычисление всех характеристик:
-    - Несущая способность
-    - Трение
-    - Динамические коэффициенты
-    - Устойчивость
-    """
-
-    def __init__(self, model: BearingModel):
-        self.model = model
-        from .geometry import create_grid
-        self.grid = create_grid(model.grid.num_phi, model.grid.num_Z)
-        self.D_over_L = model.geometry.D / model.geometry.L
-
-    def analyze(
-        self,
-        epsilon: Optional[float] = None,
-        with_texture: bool = True,
-        compute_dynamics: bool = True,
-        n_jobs: int = 8,
-    ) -> Dict:
-        """
-        Полный анализ подшипника.
-
-        Args:
-            epsilon: эксцентриситет (если None — из модели)
-            with_texture: учитывать текстуру
-            compute_dynamics: вычислять динамические коэффициенты
-            n_jobs: число параллельных задач
-
-        Returns:
-            Словарь со всеми результатами
-        """
-        if epsilon is None:
-            epsilon = self.model.operating.epsilon
-
-        texture = self.model.texture if with_texture else None
-
-        # Зазор и давление
-        H = compute_film_thickness(
-            self.grid, self.model.geometry, epsilon, texture
-        )
-
-        P, residual, iters = solve_reynolds_static(
-            H, self.grid.d_phi, self.grid.d_Z, self.D_over_L,
-            omega_sor=1.5, tol=1e-6, max_iter=50000
-        )
-
-        # Силы
-        forces = integrate_forces(
-            P, self.grid, self.model.pressure_scale,
-            self.model.geometry.R, self.model.geometry.L
-        )
-
-        # Трение
-        friction = compute_friction(P, H, self.grid, self.model)
-
-        results = {
-            "epsilon": epsilon,
-            "with_texture": with_texture,
-            "H": H,
-            "P": P,
-            "converged": residual < 1e-6,
-            "iterations": iters,
-            "forces": forces,
-            "friction": friction,
-        }
-
-        # Динамические коэффициенты
-        if compute_dynamics:
-            coeffs = compute_all_dynamic_coefficients(
-                self.model, self.grid, epsilon,
-                with_texture=with_texture, n_jobs=n_jobs
-            )
-            stability = compute_stability_parameters(coeffs)
-
-            results["dynamic_coefficients"] = coeffs
-            results["stability"] = stability
-
-        return results
+    return FullCoefficients(stiffness=stiffness, damping=damping)
 
 
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    from .parameters import create_test_bearing, create_roller_cone_bit_bearing
-    from .geometry import create_grid
+    from .parameters import create_chinese_paper_bearing
 
     # Тест
-    model = create_test_bearing()
-    print(model.info())
+    model = create_chinese_paper_bearing()
+    grid = create_grid(model.numerical.N_phi, model.numerical.N_Z)
 
-    analyzer = BearingAnalyzer(model)
+    T = 80.0
+    W_target = 2000.0  # Н
 
-    # Анализ без текстуры
-    results_smooth = analyzer.analyze(with_texture=False, compute_dynamics=False)
-    print(f"\nГладкий подшипник:")
-    print(f"  Несущая способность: {results_smooth['forces'].F_total:.1f} Н")
-    print(f"  Сила трения: {results_smooth['friction'].friction_force:.2f} Н")
-    print(f"  Коэффициент трения: {results_smooth['friction'].friction_coeff:.6f}")
+    print("=" * 60)
+    print("ТЕСТ МОДУЛЯ forces.py")
+    print("=" * 60)
 
-    # Анализ с текстурой
-    results_textured = analyzer.analyze(with_texture=True, compute_dynamics=False)
-    print(f"\nС текстурой:")
-    print(f"  Несущая способность: {results_textured['forces'].F_total:.1f} Н")
-    print(f"  Сила трения: {results_textured['friction'].friction_force:.2f} Н")
-    print(f"  Коэффициент трения: {results_textured['friction'].friction_coeff:.6f}")
+    # Поиск равновесного эксцентриситета
+    print(f"\nПоиск ε₀ для W = {W_target} Н, T = {T}°C...")
+    epsilon_0, forces = find_equilibrium_eccentricity(
+        W_target, T, model, grid, with_texture=True
+    )
+    print(f"  ε₀ = {epsilon_0:.4f}")
+    print(f"  Fx = {forces.Fx:.1f} Н")
+    print(f"  Fy = {forces.Fy:.1f} Н")
 
-    # Сравнение
-    delta_F = (results_textured['forces'].F_total - results_smooth['forces'].F_total)
-    delta_mu = (results_textured['friction'].friction_coeff - results_smooth['friction'].friction_coeff)
-    print(f"\nЭффект текстуры:")
-    print(f"  Изменение несущей способности: {delta_F/results_smooth['forces'].F_total*100:+.1f}%")
-    print(f"  Изменение коэффициента трения: {delta_mu/results_smooth['friction'].friction_coeff*100:+.1f}%")
+    # Коэффициенты жёсткости
+    print("\nВычисление коэффициентов жёсткости...")
+    K = compute_stiffness_coefficients(epsilon_0, T, model, grid, with_texture=True)
+    print(f"  K_xx = {K.K_xx/1e6:.3f} МН/м, K̄_xx = {K.K_xx_bar:.4f}")
+    print(f"  K_xy = {K.K_xy/1e6:.3f} МН/м, K̄_xy = {K.K_xy_bar:.4f}")
+    print(f"  K_yx = {K.K_yx/1e6:.3f} МН/м, K̄_yx = {K.K_yx_bar:.4f}")
+    print(f"  K_yy = {K.K_yy/1e6:.3f} МН/м, K̄_yy = {K.K_yy_bar:.4f}")
+    print(f"  Проверка: K_xy ≈ -K_yx? {abs(K.K_xy + K.K_yx) / max(abs(K.K_xy), abs(K.K_yx), 1):.2%}")
+
+    # Коэффициенты демпфирования
+    print("\nВычисление коэффициентов демпфирования...")
+    C = compute_damping_coefficients(epsilon_0, T, model, grid, with_texture=True)
+    print(f"  C_xx = {C.C_xx/1e3:.3f} кН·с/м, C̄_xx = {C.C_xx_bar:.4f}")
+    print(f"  C_xy = {C.C_xy/1e3:.3f} кН·с/м, C̄_xy = {C.C_xy_bar:.4f}")
+    print(f"  C_yx = {C.C_yx/1e3:.3f} кН·с/м, C̄_yx = {C.C_yx_bar:.4f}")
+    print(f"  C_yy = {C.C_yy/1e3:.3f} кН·с/м, C̄_yy = {C.C_yy_bar:.4f}")
+
+    print("\n" + "=" * 60)
