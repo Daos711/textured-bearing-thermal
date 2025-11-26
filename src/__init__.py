@@ -52,12 +52,19 @@ from .forces import (
     StiffnessCoefficients,
     DampingCoefficients,
     FullCoefficients,
+    THDForceResult,
     integrate_forces,
     compute_friction,
     find_equilibrium_eccentricity,
     compute_stiffness_coefficients,
     compute_damping_coefficients,
     compute_all_coefficients,
+    # THD версии функций
+    integrate_forces_thd,
+    find_equilibrium_eccentricity_thd,
+    compute_stiffness_coefficients_thd,
+    compute_damping_coefficients_thd,
+    compute_all_coefficients_thd,
 )
 
 from .stability import (
@@ -70,9 +77,11 @@ from .stability import (
 from .main import (
     PointResult,
     ParametricResults,
+    THD_MODES,
     run_parametric_calculation,
     run_full_analysis,
     plot_3d_surfaces,
+    plot_3d_surfaces_grayscale,
     plot_comparison_contours,
 )
 
@@ -87,5 +96,5 @@ from .thermal import (
     estimate_temperature_rise,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"  # Добавлен полноценный THD режим с полем вязкости η(φ,z)
 __author__ = "Textured Bearing Research"
