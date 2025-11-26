@@ -6,7 +6,24 @@
 
 Запуск:
     cd textured-bearing-thermal
-    python examples/roller_cone_bit_analysis.py
+
+    # Изотермический режим (быстрый)
+    python examples/roller_cone_bit_analysis.py --mode=isothermal
+
+    # THD с осреднённой температурой (по умолчанию)
+    python examples/roller_cone_bit_analysis.py --mode=thd_mean
+
+    # Полный THD с полем вязкости η(φ,z)
+    python examples/roller_cone_bit_analysis.py --mode=thd_full
+
+    # Чёрно-белые графики для публикации
+    python examples/roller_cone_bit_analysis.py --mode=thd_full --grayscale
+
+    # Быстрый тест
+    python examples/roller_cone_bit_analysis.py --quick
+
+    # Полный расчёт
+    python examples/roller_cone_bit_analysis.py --mode=thd_full --full --grayscale
 """
 
 import sys
@@ -29,7 +46,13 @@ rcParams['font.family'] = 'DejaVu Sans'
 
 from src.parameters import create_chinese_paper_bearing, create_roller_cone_bit_bearing
 from src.geometry import create_grid, compute_film_thickness_static
-from src.main import run_parametric_calculation, run_full_analysis, plot_3d_surfaces
+from src.main import (
+    run_parametric_calculation,
+    run_full_analysis,
+    plot_3d_surfaces,
+    plot_3d_surfaces_grayscale,
+    THD_MODES,
+)
 
 
 def single_point_analysis():
@@ -98,9 +121,13 @@ def single_point_analysis():
     print(f"  ΔK_eq = {delta_Keq:+.2f}%")
 
 
-def parametric_analysis_small():
+def parametric_analysis_small(mode: str = "thd_mean", grayscale: bool = False):
     """
     Небольшой параметрический расчёт для быстрой проверки.
+
+    Args:
+        mode: режим расчёта ("isothermal", "thd_mean", "thd_full")
+        grayscale: использовать чёрно-белые графики для публикации
     """
     print("\n" + "=" * 60)
     print("ПАРАМЕТРИЧЕСКИЙ РАСЧЁТ (МАЛЫЙ)")
@@ -112,29 +139,41 @@ def parametric_analysis_small():
     model.numerical.N_Z = 40
 
     # Малая сетка для быстрого теста
-    # use_thd=True включает термогидродинамический расчёт
+    # mode="thd_mean" — быстрый THD с осреднённой температурой
+    # mode="thd_full" — полный THD с полем вязкости η(φ,z)
     results_smooth = run_parametric_calculation(
-        model, with_texture=False, N_W=5, N_T=4, use_thd=True
+        model, with_texture=False, N_W=5, N_T=4, mode=mode
     )
 
     results_textured = run_parametric_calculation(
-        model, with_texture=True, N_W=5, N_T=4, use_thd=True
+        model, with_texture=True, N_W=5, N_T=4, mode=mode
     )
 
     print("\n--- Результаты (гладкий) ---")
     print(f"  W: [{results_smooth.W_arr[0]:.1f}, {results_smooth.W_arr[-1]:.1f}] Н")
     print(f"  T: [{results_smooth.T_arr[0]:.1f}, {results_smooth.T_arr[-1]:.1f}] °C")
     print(f"  Точек: {results_smooth.W_mesh.size}")
+    print(f"  Режим: {results_smooth.mode}")
 
     # Построение 3D графиков
-    plot_3d_surfaces(results_smooth, results_textured, save_dir=RESULTS_DIR)
+    if grayscale:
+        plot_3d_surfaces_grayscale(results_smooth, results_textured, save_dir=RESULTS_DIR)
+    else:
+        plot_3d_surfaces(results_smooth, results_textured, save_dir=RESULTS_DIR)
     print(f"\nГрафики сохранены в {RESULTS_DIR}")
     plt.show()
 
 
-def parametric_analysis_full():
+def parametric_analysis_full(mode: str = "thd_mean", grayscale: bool = False):
     """
     Полный параметрический расчёт.
+
+    Args:
+        mode: режим расчёта:
+              - "isothermal" — изотермический (быстрый)
+              - "thd_mean" — THD с осреднённой температурой
+              - "thd_full" — полный THD с полем вязкости η(φ,z)
+        grayscale: чёрно-белые графики для публикации
     """
     print("\n" + "=" * 60)
     print("ПОЛНЫЙ ПАРАМЕТРИЧЕСКИЙ РАСЧЁТ")
@@ -147,13 +186,15 @@ def parametric_analysis_full():
     print(f"  L = {model.geometry.L*1000:.1f} мм")
     print(f"  λ = {model.geometry.lambda_ratio:.3f}")
 
-    # Полный расчёт с термогидродинамическим режимом
+    # Полный расчёт
+    # mode="thd_full" — самый точный, но медленный
     results_smooth, results_textured = run_full_analysis(
         model=model,
         N_W=8,
         N_T=6,
         save_dir=RESULTS_DIR,
-        use_thd=True
+        mode=mode,
+        grayscale=grayscale,
     )
 
     plt.show()
@@ -574,10 +615,35 @@ def friction_verification():
 
 def main():
     """Главная функция."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Анализ подшипника с текстурой")
+    parser.add_argument(
+        "--mode", type=str, default="thd_mean",
+        choices=THD_MODES,
+        help="Режим расчёта: isothermal, thd_mean, thd_full (по умолчанию: thd_mean)"
+    )
+    parser.add_argument(
+        "--grayscale", "--bw", action="store_true",
+        help="Чёрно-белые графики для публикации"
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Запустить полный параметрический расчёт"
+    )
+    parser.add_argument(
+        "--quick", action="store_true",
+        help="Только быстрые тесты (без переборов)"
+    )
+
+    args = parser.parse_args()
+
     print("\n" + "=" * 60)
     print("АНАЛИЗ УСТОЙЧИВОСТИ ПОДШИПНИКА")
     print("С УЧЁТОМ ТЕКСТУРЫ И ТЕМПЕРАТУРЫ")
     print("=" * 60)
+    print(f"Режим THD: {args.mode}")
+    print(f"Чёрно-белые графики: {'Да' if args.grayscale else 'Нет'}")
 
     # 1. Анализ в одной точке
     single_point_analysis()
@@ -585,23 +651,22 @@ def main():
     # 2. Влияние температуры
     compare_temperature_effect()
 
-    # 3. Малый параметрический расчёт (быстрый)
-    parametric_analysis_small()
+    # 3. Малый параметрический расчёт
+    parametric_analysis_small(mode=args.mode, grayscale=args.grayscale)
 
-    # === НОВЫЕ ФУНКЦИИ ===
+    if not args.quick:
+        # 4. Графики γ²_st(W) при фиксированных T
+        stability_vs_load_at_fixed_T()
 
-    # 4. Графики γ²_st(W) при фиксированных T (аналог диссертации)
-    stability_vs_load_at_fixed_T()
+        # 5. Перебор параметров текстуры
+        texture_parameter_sweep()
 
-    # 5. Перебор параметров текстуры
-    texture_parameter_sweep()
+        # 6. Проверка порядка величин трения
+        friction_verification()
 
-    # 6. Проверка порядка величин трения
-    friction_verification()
-
-    # 7. Полный параметрический расчёт (долгий)
-    # Раскомментируйте для полного расчёта:
-    # parametric_analysis_full()
+    # 7. Полный параметрический расчёт (если запрошен)
+    if args.full:
+        parametric_analysis_full(mode=args.mode, grayscale=args.grayscale)
 
     print("\n" + "=" * 60)
     print("АНАЛИЗ ЗАВЕРШЁН")
