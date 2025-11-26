@@ -108,6 +108,7 @@ class LubricantProperties:
     T_ref: float = 40.0         # Опорная температура для вязкости, °C
     rho: float = 870.0          # Плотность, кг/м³
     c_p: float = 2000.0         # Теплоёмкость, Дж/(кг·°C)
+    k: float = 0.14             # Теплопроводность, Вт/(м·°C)
 
     def viscosity(self, T: float) -> float:
         """
@@ -126,6 +127,7 @@ class LubricantProperties:
 class OperatingConditions:
     """Режим работы."""
     n_rpm: float = 100.0        # Частота вращения, об/мин
+    T_inlet: float = 40.0       # Температура смазки на входе, °C
 
     # Диапазоны для параметрического расчёта
     W_min: float = 100.0        # Минимальная нагрузка, Н

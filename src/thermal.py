@@ -53,7 +53,7 @@ def compute_viscosity_field(
     """
     Вычисление поля вязкости по полю температуры.
 
-    η(T) = η_0 · exp(-β·(T - T_0))
+    η(T) = η_ref · exp(-β_η·(T - T_ref))
 
     Args:
         T: температура (°C) на сетке
@@ -62,7 +62,7 @@ def compute_viscosity_field(
     Returns:
         eta: вязкость (Па·с) на сетке
     """
-    return lubricant.eta_0 * np.exp(-lubricant.beta * (T - lubricant.T_0))
+    return lubricant.eta_ref * np.exp(-lubricant.beta_eta * (T - lubricant.T_ref))
 
 
 def compute_viscosity_ratio(
@@ -203,19 +203,22 @@ class ThermalModel:
         self.grid = grid
 
         # Характерные величины
-        self.D_over_L = model.geometry.D / model.geometry.L
+        self.D_over_L = model.geometry.D_J / model.geometry.L
+
+        # Окружная скорость
+        U = model.operating.U(model.geometry.R_J)
 
         # Число Пекле (отношение конвекции к теплопроводности)
         # Pe = ρ·c_p·U·c / k
         self.Pe = (model.lubricant.rho * model.lubricant.c_p *
-                   model.U * model.geometry.c / model.lubricant.k)
+                   U * model.geometry.c0 / model.lubricant.k)
 
         # Масштаб температуры (подъём от диссипации)
         # Используем число Бринкмана: Br = η·U² / (k·ΔT)
         # ΔT_ref ~ η·U² / k · (R/c) — характерный подъём
         eta_ref = model.lubricant.viscosity(model.operating.T_inlet)
-        self.delta_T_ref = (eta_ref * model.U ** 2 * model.geometry.R /
-                           (model.lubricant.k * model.geometry.c))
+        self.delta_T_ref = (eta_ref * U ** 2 * model.geometry.R_J /
+                           (model.lubricant.k * model.geometry.c0))
 
     def compute_temperature_field(
         self,
@@ -290,11 +293,12 @@ class THDSolver:
         self.grid = grid
         self.thermal = ThermalModel(model, grid)
 
-        # Импортируем Reynolds solver здесь чтобы избежать циклического импорта
-        from .reynolds import ReynoldsSolver
-        self.reynolds = ReynoldsSolver(
-            grid, model.geometry.D / model.geometry.L
-        )
+        # Параметры для уравнения Рейнольдса
+        self.lambda_sq = model.geometry.lambda_ratio ** 2
+        self.omega_sor = model.numerical.omega_GS
+        self.tol_re = model.numerical.tol_Re
+        self.max_iter_re = model.numerical.max_iter_Re
+        self.use_cavitation = model.numerical.use_cavitation
 
     def solve(
         self,
@@ -318,18 +322,40 @@ class THDSolver:
             eta: вязкость
             converged: сошлось ли
         """
+        # Импортируем здесь чтобы избежать циклического импорта
+        from .reynolds import solve_reynolds_equation
+
         # Начальные условия
         T = np.ones_like(H) * self.model.operating.T_inlet
         eta_ratio = np.ones_like(H)
+
+        # Вычисляем ∂H/∂φ численно
+        N_Z, N_phi = H.shape
+        dH_dphi = np.zeros_like(H)
+        for i in range(N_Z):
+            for j in range(N_phi):
+                j_plus = (j + 1) % N_phi
+                j_minus = (j - 1) % N_phi
+                dH_dphi[i, j] = (H[i, j_plus] - H[i, j_minus]) / (2.0 * self.grid.d_phi)
+
+        # ∂H/∂τ = 0 для статики
+        dH_dtau = np.zeros_like(H)
 
         converged = False
 
         for iteration in range(max_iter):
             T_old = T.copy()
 
-            # 1. Решаем Reynolds с текущей вязкостью
-            solution = self.reynolds.solve_thermal(H, eta_ratio)
-            P = solution.P
+            # 1. Решаем Reynolds с текущей вязкостью (используем eta_ratio как массив)
+            P, residual, iters = solve_reynolds_equation(
+                H, eta_ratio, dH_dphi, dH_dtau,
+                self.grid.d_phi, self.grid.d_Z, self.lambda_sq,
+                beta=0.0,  # статика
+                omega_sor=self.omega_sor,
+                tol=self.tol_re,
+                max_iter=self.max_iter_re,
+                use_cavitation=self.use_cavitation
+            )
 
             # 2. Вычисляем температуру
             thermal_sol = self.thermal.compute_temperature_field(H, P)
@@ -372,10 +398,10 @@ def estimate_temperature_rise(model: BearingModel) -> float:
         ΔT: оценка подъёма температуры (°C)
     """
     eta = model.lubricant.viscosity(model.operating.T_inlet)
-    U = model.U
-    c = model.geometry.c
+    U = model.operating.U(model.geometry.R_J)
+    c = model.geometry.c0
     L = model.geometry.L
-    R = model.geometry.R
+    R = model.geometry.R_J
     rho = model.lubricant.rho
     c_p = model.lubricant.c_p
 
@@ -395,8 +421,8 @@ def estimate_temperature_rise(model: BearingModel) -> float:
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
-    from .parameters import create_roller_cone_bit_bearing, create_test_bearing
-    from .geometry import create_grid, compute_film_thickness
+    from .parameters import create_roller_cone_bit_bearing
+    from .geometry import create_grid, compute_film_thickness_static
 
     # Тест для шарошечного долота
     model = create_roller_cone_bit_bearing()
@@ -407,9 +433,11 @@ if __name__ == "__main__":
     print(f"\nОценка подъёма температуры: ΔT ≈ {delta_T_est:.1f}°C")
 
     # Создаём сетку и зазор
-    grid = create_grid(model.grid.num_phi, model.grid.num_Z)
-    H = compute_film_thickness(grid, model.geometry, model.operating.epsilon,
-                              model.texture)
+    grid = create_grid(model.numerical.N_phi, model.numerical.N_Z)
+    epsilon_0 = 0.5  # Тестовое значение эксцентриситета
+    H = compute_film_thickness_static(
+        grid, model.geometry, epsilon_0, model.texture
+    )
 
     # Решаем THD задачу
     thd = THDSolver(model, grid)

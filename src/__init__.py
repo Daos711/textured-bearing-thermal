@@ -9,6 +9,7 @@ Textured Bearing Thermal Model
 - forces: силы, коэффициенты жёсткости/демпфирования
 - stability: параметры устойчивости
 - main: параметрический расчёт
+- thermal: термогидродинамическая модель (THD)
 """
 
 from .parameters import (
@@ -73,6 +74,17 @@ from .main import (
     run_full_analysis,
     plot_3d_surfaces,
     plot_comparison_contours,
+)
+
+from .thermal import (
+    ThermalSolution,
+    ThermalModel,
+    THDSolver,
+    compute_viscosity_field,
+    compute_viscosity_ratio,
+    compute_heat_dissipation,
+    solve_energy_equation,
+    estimate_temperature_rise,
 )
 
 __version__ = "0.2.0"
