@@ -50,8 +50,8 @@ def single_point_analysis():
     model = create_chinese_paper_bearing()
     grid = create_grid(180, 50)
 
-    W = 100.0  # Н
-    T = 40.0   # °C
+    W = 50.0   # Н (уменьшено для умеренного ε)
+    T = 30.0   # °C (низкая температура для зоны устойчивости)
 
     print(f"\nПараметры:")
     print(f"  Нагрузка W = {W} Н")
@@ -174,8 +174,8 @@ def compare_temperature_effect():
     model = create_chinese_paper_bearing()
     grid = create_grid(180, 50)
 
-    W = 100.0  # Н
-    temperatures = [30, 40, 50, 60, 70, 80]
+    W = 50.0  # Н (уменьшено для видимости зоны устойчивости)
+    temperatures = [25, 30, 35, 40, 45, 50]  # Пониженные температуры
 
     eps_smooth_list = []
     eps_tex_list = []
@@ -268,8 +268,8 @@ def stability_vs_load_at_fixed_T():
     model = create_chinese_paper_bearing()
     grid = create_grid(180, 50)
 
-    temperatures = [40, 60, 80]  # °C
-    W_arr = np.linspace(500, 8000, 20)  # Н
+    temperatures = [30, 40, 50]  # °C (пониженные для видимости зоны устойчивости)
+    W_arr = np.linspace(20, 500, 20)  # Н (уменьшенные нагрузки)
 
     results = {T: {'smooth': {}, 'textured': {}} for T in temperatures}
 
@@ -372,9 +372,9 @@ def texture_parameter_sweep():
     model = create_chinese_paper_bearing()
     grid = create_grid(120, 40)
 
-    # Фиксированные условия
-    W = 2000.0  # Н
-    T = 60.0    # °C
+    # Фиксированные условия (уменьшены для лучшей визуализации)
+    W = 100.0   # Н
+    T = 35.0    # °C (низкая температура для умеренного ε)
 
     # Диапазоны параметров текстуры
     h_p_arr = np.array([5, 10, 15, 20, 30]) * 1e-6     # мкм -> м
@@ -507,10 +507,10 @@ def friction_verification():
     grid = create_grid(180, 50)
 
     test_points = [
-        (1000.0, 40.0),
-        (2000.0, 60.0),
-        (5000.0, 80.0),
-        (8000.0, 100.0),
+        (50.0, 30.0),
+        (100.0, 35.0),
+        (200.0, 40.0),
+        (500.0, 50.0),
     ]
 
     print(f"\nПараметры модели:")
@@ -558,8 +558,8 @@ def friction_verification():
 
     # Проверка масштабов
     print("\n--- Анализ масштабов ---")
-    T_test = 60.0
-    W_test = 2000.0
+    T_test = 35.0
+    W_test = 100.0
     eta = model.lubricant.viscosity(T_test)
     U = model.operating.U(model.geometry.R_J)
 

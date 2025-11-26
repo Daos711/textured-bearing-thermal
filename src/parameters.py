@@ -285,10 +285,10 @@ def create_chinese_paper_bearing(
 
     operating = OperatingConditions(
         n_rpm=n_rpm,
-        W_min=500.0,            # 500 Н
-        W_max=10000.0,          # 10 кН
-        T_min=40.0,
-        T_max=120.0,
+        W_min=50.0,             # 50 Н (меньше для видимости зоны устойчивости)
+        W_max=2000.0,           # 2 кН (уменьшено для лучшей визуализации)
+        T_min=30.0,             # 30°C (понижено для большей вязкости)
+        T_max=100.0,            # 100°C
         N_W=20,
         N_T=15,
     )
