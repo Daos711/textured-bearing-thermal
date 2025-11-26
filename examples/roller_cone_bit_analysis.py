@@ -112,12 +112,13 @@ def parametric_analysis_small():
     model.numerical.N_Z = 40
 
     # Малая сетка для быстрого теста
+    # use_thd=True включает термогидродинамический расчёт
     results_smooth = run_parametric_calculation(
-        model, with_texture=False, N_W=5, N_T=4
+        model, with_texture=False, N_W=5, N_T=4, use_thd=True
     )
 
     results_textured = run_parametric_calculation(
-        model, with_texture=True, N_W=5, N_T=4
+        model, with_texture=True, N_W=5, N_T=4, use_thd=True
     )
 
     print("\n--- Результаты (гладкий) ---")
@@ -146,12 +147,13 @@ def parametric_analysis_full():
     print(f"  L = {model.geometry.L*1000:.1f} мм")
     print(f"  λ = {model.geometry.lambda_ratio:.3f}")
 
-    # Полный расчёт
+    # Полный расчёт с термогидродинамическим режимом
     results_smooth, results_textured = run_full_analysis(
         model=model,
         N_W=8,
         N_T=6,
-        save_dir=RESULTS_DIR
+        save_dir=RESULTS_DIR,
+        use_thd=True
     )
 
     plt.show()
