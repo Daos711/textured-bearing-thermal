@@ -309,7 +309,7 @@ def stability_vs_load_at_fixed_T():
 
     # Графики
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    colors = {40: 'blue', 60: 'green', 80: 'red'}
+    colors = {30: 'blue', 40: 'green', 50: 'red'}
     W_kN = W_arr / 1000
 
     # γ²_st(W)
