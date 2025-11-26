@@ -196,7 +196,7 @@ def find_equilibrium_eccentricity(
     grid: Grid,
     with_texture: bool = True,
     eps_min: float = 0.01,
-    eps_max: float = 0.95,
+    eps_max: float = 0.98,
     tol: float = 1e-3,
 ) -> Tuple[float, ForceResult]:
     """
@@ -250,14 +250,19 @@ def find_equilibrium_eccentricity(
     r_max = residual(eps_max)
 
     # Если знаки одинаковые, расширяем диапазон или возвращаем границу
+    at_boundary = False
     if r_min * r_max > 0:
         if abs(r_min) < abs(r_max):
             epsilon_0 = eps_min
         else:
             epsilon_0 = eps_max
+        at_boundary = True
     else:
         # Метод Брента для поиска корня
         epsilon_0 = brentq(residual, eps_min, eps_max, xtol=1e-4)
+        # Проверяем близость к границе
+        if epsilon_0 > eps_max - 0.01:
+            at_boundary = True
 
     # Вычисляем силы при найденном ε₀
     H = compute_film_thickness_static(

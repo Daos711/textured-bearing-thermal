@@ -108,6 +108,7 @@ class LubricantProperties:
     T_ref: float = 40.0         # Опорная температура для вязкости, °C
     rho: float = 870.0          # Плотность, кг/м³
     c_p: float = 2000.0         # Теплоёмкость, Дж/(кг·°C)
+    k: float = 0.14             # Теплопроводность, Вт/(м·°C)
 
     def viscosity(self, T: float) -> float:
         """
@@ -126,6 +127,7 @@ class LubricantProperties:
 class OperatingConditions:
     """Режим работы."""
     n_rpm: float = 100.0        # Частота вращения, об/мин
+    T_inlet: float = 40.0       # Температура смазки на входе, °C
 
     # Диапазоны для параметрического расчёта
     W_min: float = 100.0        # Минимальная нагрузка, Н
@@ -285,10 +287,10 @@ def create_chinese_paper_bearing(
 
     operating = OperatingConditions(
         n_rpm=n_rpm,
-        W_min=500.0,            # 500 Н
-        W_max=10000.0,          # 10 кН
-        T_min=40.0,
-        T_max=120.0,
+        W_min=50.0,             # 50 Н (меньше для видимости зоны устойчивости)
+        W_max=2000.0,           # 2 кН (уменьшено для лучшей визуализации)
+        T_min=30.0,             # 30°C (понижено для большей вязкости)
+        T_max=100.0,            # 100°C
         N_W=20,
         N_T=15,
     )
