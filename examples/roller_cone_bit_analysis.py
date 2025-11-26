@@ -107,27 +107,27 @@ def parametric_analysis_small():
     print("=" * 60)
 
     model = create_chinese_paper_bearing()
+    # Уменьшаем сетку для быстрого теста
+    model.numerical.N_phi = 120
+    model.numerical.N_Z = 40
 
     # Малая сетка для быстрого теста
     results_smooth = run_parametric_calculation(
-        model, with_texture=False, N_W=5, N_T=4, N_phi=120, N_Z=40
+        model, with_texture=False, N_W=5, N_T=4
     )
 
     results_textured = run_parametric_calculation(
-        model, with_texture=True, N_W=5, N_T=4, N_phi=120, N_Z=40
+        model, with_texture=True, N_W=5, N_T=4
     )
 
     print("\n--- Результаты (гладкий) ---")
-    print(f"  W: [{results_smooth.W_range[0]:.1f}, {results_smooth.W_range[-1]:.1f}] Н")
-    print(f"  T: [{results_smooth.T_range[0]:.1f}, {results_smooth.T_range[-1]:.1f}] °C")
-    print(f"  Точек: {len(results_smooth.results)}")
+    print(f"  W: [{results_smooth.W_arr[0]:.1f}, {results_smooth.W_arr[-1]:.1f}] Н")
+    print(f"  T: [{results_smooth.T_arr[0]:.1f}, {results_smooth.T_arr[-1]:.1f}] °C")
+    print(f"  Точек: {results_smooth.W_mesh.size}")
 
     # Построение 3D графиков
-    fig = plot_3d_surfaces(results_smooth, results_textured, title_prefix="Малый тест")
-
-    filepath = os.path.join(RESULTS_DIR, 'parametric_small.png')
-    fig.savefig(filepath, dpi=150)
-    print(f"\nГрафики сохранены в {filepath}")
+    plot_3d_surfaces(results_smooth, results_textured, save_dir=RESULTS_DIR)
+    print(f"\nГрафики сохранены в {RESULTS_DIR}")
     plt.show()
 
 
@@ -147,13 +147,11 @@ def parametric_analysis_full():
     print(f"  λ = {model.geometry.lambda_ratio:.3f}")
 
     # Полный расчёт
-    results_smooth, results_textured, fig = run_full_analysis(
+    results_smooth, results_textured = run_full_analysis(
         model=model,
         N_W=8,
         N_T=6,
-        N_phi=180,
-        N_Z=50,
-        save_path=os.path.join(RESULTS_DIR, 'stability_surfaces.png')
+        save_dir=RESULTS_DIR
     )
 
     plt.show()
