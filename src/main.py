@@ -36,6 +36,13 @@ from .forces import (
     ForceResult,
     StiffnessCoefficients,
     DampingCoefficients,
+    # THD версии функций
+    integrate_forces_thd,
+    find_equilibrium_eccentricity_thd,
+    compute_stiffness_coefficients_thd,
+    compute_damping_coefficients_thd,
+    compute_all_coefficients_thd,
+    THDForceResult,
 )
 from .stability import compute_stability_parameters, StabilityParameters
 from .reynolds import solve_reynolds_static
@@ -54,6 +61,13 @@ class PointResult:
     stability: StabilityParameters  # Параметры устойчивости
     mu_f: Optional[float] = None    # Коэффициент трения
     N_f: Optional[float] = None     # Мощность потерь, Вт
+
+
+# Допустимые режимы расчёта
+# "isothermal" - изотермический (постоянная вязкость η(T_inlet))
+# "thd_mean"   - THD с осреднённой температурой (быстрый приближённый режим)
+# "thd_full"   - полный THD с полем вязкости η(φ,z) (самый точный)
+THD_MODES = ("isothermal", "thd_mean", "thd_full")
 
 
 @dataclass
@@ -77,7 +91,11 @@ class ParametricResults:
     # THD результаты
     T_mean: Optional[np.ndarray] = None   # Средняя температура из THD
     T_max: Optional[np.ndarray] = None    # Максимальная температура из THD
-    use_thd: bool = False                 # Использовался ли THD-расчёт
+    # Поля η(φ,z) (только для thd_full, опционально)
+    eta_field_sample: Optional[np.ndarray] = None  # Пример поля вязкости
+    # Режим расчёта
+    mode: str = "isothermal"              # Режим: isothermal, thd_mean, thd_full
+    use_thd: bool = False                 # Использовался ли THD-расчёт (для обратной совместимости)
 
 
 def run_parametric_calculation(
@@ -86,7 +104,8 @@ def run_parametric_calculation(
     N_W: Optional[int] = None,
     N_T: Optional[int] = None,
     compute_friction_flag: bool = True,
-    use_thd: bool = False,
+    mode: str = "isothermal",
+    use_thd: bool = False,  # Deprecated: используйте mode="thd_mean"
     verbose: bool = True,
 ) -> ParametricResults:
     """
@@ -98,14 +117,26 @@ def run_parametric_calculation(
         N_W: число точек по нагрузке (если None — из model.operating)
         N_T: число точек по температуре
         compute_friction_flag: вычислять трение
-        use_thd: использовать термогидродинамический расчёт (THD)
-                 Если True: T_arr — это T_inlet, THD вычисляет реальную T(φ,z),
-                 средняя T_mean используется для коэффициентов K, C
+        mode: режим расчёта:
+              - "isothermal": изотермический (постоянная вязкость η(T_inlet))
+              - "thd_mean": THD с осреднённой температурой (быстрый режим)
+              - "thd_full": полный THD с полем вязкости η(φ,z)
+        use_thd: DEPRECATED - для обратной совместимости; эквивалентно mode="thd_mean"
         verbose: выводить прогресс
 
     Returns:
         ParametricResults
     """
+    # Обратная совместимость: если use_thd=True, но mode не задан
+    if use_thd and mode == "isothermal":
+        mode = "thd_mean"
+
+    # Проверка режима
+    if mode not in THD_MODES:
+        raise ValueError(f"Неизвестный режим '{mode}'. Допустимые: {THD_MODES}")
+
+    use_thd_any = mode in ("thd_mean", "thd_full")
+
     # Параметры диапазонов
     if N_W is None:
         N_W = model.operating.N_W
@@ -129,8 +160,8 @@ def run_parametric_calculation(
     C_yy_bar = np.zeros((N_T, N_W))
 
     # THD результаты
-    T_mean_arr = np.zeros((N_T, N_W)) if use_thd else None
-    T_max_arr = np.zeros((N_T, N_W)) if use_thd else None
+    T_mean_arr = np.zeros((N_T, N_W)) if use_thd_any else None
+    T_max_arr = np.zeros((N_T, N_W)) if use_thd_any else None
 
     if compute_friction_flag:
         mu_f = np.zeros((N_T, N_W))
@@ -142,8 +173,15 @@ def run_parametric_calculation(
     # Расчётная сетка
     grid = create_grid(model.numerical.N_phi, model.numerical.N_Z)
 
-    # THD solver (создаём один раз)
-    thd_solver = THDSolver(model, grid) if use_thd else None
+    # THD solver (создаём один раз для thd_mean и thd_full)
+    thd_solver = THDSolver(model, grid) if use_thd_any else None
+
+    # Названия режимов для вывода
+    mode_names = {
+        "isothermal": "Изотермический",
+        "thd_mean": "THD (осреднённая температура)",
+        "thd_full": "THD (полное поле вязкости η(φ,z))",
+    }
 
     # Итератор
     total = N_T * N_W
@@ -151,11 +189,11 @@ def run_parametric_calculation(
     if verbose:
         print(f"Параметрический расчёт: {N_T} x {N_W} = {total} точек")
         print(f"Текстура: {'Да' if with_texture else 'Нет'}")
-        print(f"Режим: {'THD (термогидродинамический)' if use_thd else 'Изотермический'}")
+        print(f"Режим: {mode_names[mode]}")
         if with_texture:
             n_cells = get_texture_centers_count(model.texture, model.geometry)
             print(f"  Число углублений: {n_cells}")
-        if use_thd:
+        if use_thd_any:
             delta_T_est = estimate_temperature_rise(model)
             print(f"  Оценка подъёма температуры: ΔT ≈ {delta_T_est:.1f}°C")
         iterator = tqdm(iterator, desc="Расчёт")
@@ -164,19 +202,35 @@ def run_parametric_calculation(
         i_T = idx // N_W
         i_W = idx % N_W
 
-        T_inlet = T_arr[i_T]  # Входная температура (или рабочая в изотермическом режиме)
+        T_inlet = T_arr[i_T]  # Входная температура
         W = W_arr[i_W]
 
         try:
-            # --- Шаг 1: Поиск равновесного эксцентриситета ---
-            # В обоих режимах используем T_inlet для начального приближения
-            eps_0, forces = find_equilibrium_eccentricity(
-                W, T_inlet, model, grid, with_texture=with_texture
-            )
-            epsilon_0[i_T, i_W] = eps_0
+            # ================================================================
+            # РЕЖИМ: isothermal
+            # ================================================================
+            if mode == "isothermal":
+                # Поиск равновесного эксцентриситета (изотермический)
+                eps_0, forces = find_equilibrium_eccentricity(
+                    W, T_inlet, model, grid, with_texture=with_texture
+                )
+                epsilon_0[i_T, i_W] = eps_0
+                T_effective = T_inlet
 
-            # --- Шаг 2: THD расчёт (если включен) ---
-            if use_thd:
+                # Коэффициенты жёсткости и демпфирования (изотермические)
+                K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
+                C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
+
+            # ================================================================
+            # РЕЖИМ: thd_mean (быстрый THD с осреднённой температурой)
+            # ================================================================
+            elif mode == "thd_mean":
+                # Сначала находим ε₀ изотермически
+                eps_0, forces = find_equilibrium_eccentricity(
+                    W, T_inlet, model, grid, with_texture=with_texture
+                )
+                epsilon_0[i_T, i_W] = eps_0
+
                 # Вычисляем зазор при найденном ε₀
                 H_T = model.material.H_T(model.geometry, T_inlet)
                 texture = model.texture if with_texture else None
@@ -188,7 +242,7 @@ def run_parametric_calculation(
                 original_T_inlet = model.operating.T_inlet
                 model.operating.T_inlet = T_inlet
 
-                # Решаем THD задачу: Рейнольдс + Энергия итерационно
+                # Решаем THD задачу для получения T_mean
                 P_thd, T_field, eta_field, thd_converged = thd_solver.solve(
                     H, max_iter=15, tol=0.5, verbose=False
                 )
@@ -202,27 +256,53 @@ def run_parametric_calculation(
                 T_mean_arr[i_T, i_W] = T_mean
                 T_max_arr[i_T, i_W] = T_max
 
-                # Используем T_mean для расчёта коэффициентов
+                # Используем T_mean для расчёта коэффициентов (изотермический расчёт при T_mean)
                 T_effective = T_mean
-            else:
-                T_effective = T_inlet
+                K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
+                C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
 
-            # --- Шаг 3: Коэффициенты жёсткости и демпфирования ---
-            K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
-            C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
+            # ================================================================
+            # РЕЖИМ: thd_full (полный THD с полем вязкости)
+            # ================================================================
+            elif mode == "thd_full":
+                # Поиск ε₀ с полным THD на каждой итерации
+                eps_0, thd_result = find_equilibrium_eccentricity_thd(
+                    W, T_inlet, model, grid, thd_solver,
+                    with_texture=with_texture,
+                    thd_max_iter=15, thd_tol=0.5
+                )
+                epsilon_0[i_T, i_W] = eps_0
 
+                # Сохраняем температуры из THD
+                T_mean_arr[i_T, i_W] = thd_result.T_mean
+                T_max_arr[i_T, i_W] = thd_result.T_max
+                T_effective = thd_result.T_mean
+
+                # Коэффициенты K и C с полным THD (поле вязкости η(φ,z))
+                K = compute_stiffness_coefficients_thd(
+                    eps_0, T_inlet, model, grid, thd_solver,
+                    with_texture=with_texture,
+                    thd_max_iter=10, thd_tol=1.0
+                )
+                C = compute_damping_coefficients_thd(
+                    eps_0, T_inlet, model, grid, thd_solver,
+                    with_texture=with_texture,
+                    thd_max_iter=10, thd_tol=1.0
+                )
+
+            # Сохраняем коэффициенты
             K_xx_bar[i_T, i_W] = K.K_xx_bar
             K_yy_bar[i_T, i_W] = K.K_yy_bar
             C_xx_bar[i_T, i_W] = C.C_xx_bar
             C_yy_bar[i_T, i_W] = C.C_yy_bar
 
-            # --- Шаг 4: Параметры устойчивости ---
+            # Параметры устойчивости
             stability = compute_stability_parameters(K, C)
             K_eq[i_T, i_W] = stability.K_eq
             gamma_sq[i_T, i_W] = stability.gamma_sq
             omega_st[i_T, i_W] = stability.omega_st
 
-            # --- Шаг 5: Трение (опционально) ---
+            # Трение (опционально)
             if compute_friction_flag:
                 eta_hat = model.lubricant.eta_hat(T_effective)
                 H_T = model.material.H_T(model.geometry, T_effective)
@@ -231,14 +311,28 @@ def run_parametric_calculation(
                 H = compute_film_thickness_static(
                     grid, model.geometry, eps_0, texture, H_T
                 )
-                P, _, _ = solve_reynolds_static(
-                    H, eta_hat,
-                    grid.d_phi, grid.d_Z,
-                    model.geometry.lambda_ratio ** 2,
-                    omega_sor=model.numerical.omega_GS,
-                    tol=model.numerical.tol_Re,
-                    max_iter=model.numerical.max_iter_Re,
-                )
+
+                if mode == "thd_full":
+                    # Для thd_full используем P из THD (если доступно)
+                    # Упрощённо: пересчитываем при T_effective
+                    P, _, _ = solve_reynolds_static(
+                        H, eta_hat,
+                        grid.d_phi, grid.d_Z,
+                        model.geometry.lambda_ratio ** 2,
+                        omega_sor=model.numerical.omega_GS,
+                        tol=model.numerical.tol_Re,
+                        max_iter=model.numerical.max_iter_Re,
+                    )
+                else:
+                    P, _, _ = solve_reynolds_static(
+                        H, eta_hat,
+                        grid.d_phi, grid.d_Z,
+                        model.geometry.lambda_ratio ** 2,
+                        omega_sor=model.numerical.omega_GS,
+                        tol=model.numerical.tol_Re,
+                        max_iter=model.numerical.max_iter_Re,
+                    )
+
                 friction = compute_friction(P, H, grid, model, T_effective)
                 mu_f[i_T, i_W] = friction.friction_coeff
                 N_f[i_T, i_W] = friction.power_loss
@@ -250,7 +344,7 @@ def run_parametric_calculation(
             K_eq[i_T, i_W] = np.nan
             gamma_sq[i_T, i_W] = np.nan
             omega_st[i_T, i_W] = np.nan
-            if use_thd:
+            if use_thd_any:
                 T_mean_arr[i_T, i_W] = np.nan
                 T_max_arr[i_T, i_W] = np.nan
 
@@ -271,7 +365,8 @@ def run_parametric_calculation(
         C_yy_bar=C_yy_bar,
         T_mean=T_mean_arr,
         T_max=T_max_arr,
-        use_thd=use_thd,
+        mode=mode,
+        use_thd=use_thd_any,
     )
 
 
@@ -364,6 +459,115 @@ def plot_3d_surfaces(
     plt.close()
 
 
+def plot_3d_surfaces_grayscale(
+    results_smooth: ParametricResults,
+    results_textured: ParametricResults,
+    save_dir: str = "results",
+) -> None:
+    """
+    Построение 3D-поверхностей в градациях серого для публикаций.
+
+    Гладкий подшипник: светло-серая заливка с чёрными линиями
+    Текстурированный: тёмно-серая заливка с белыми линиями (или штриховка)
+
+    Args:
+        results_smooth: результаты для гладкого подшипника
+        results_textured: результаты для текстурированного подшипника
+        save_dir: директория для сохранения графиков
+    """
+    from matplotlib.colors import LinearSegmentedColormap
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    W = results_smooth.W_mesh / 1000  # кН
+    T = results_smooth.T_mesh
+
+    # Создаём оттенки серого colormaps
+    # Гладкий: светло-серые оттенки (от белого к светло-серому)
+    cmap_smooth = LinearSegmentedColormap.from_list('smooth_gray', ['#FFFFFF', '#A0A0A0'])
+    # Текстурированный: тёмно-серые оттенки (от серого к тёмно-серому)
+    cmap_textured = LinearSegmentedColormap.from_list('textured_gray', ['#808080', '#303030'])
+
+    fig = plt.figure(figsize=(18, 12))
+
+    # --- K_eq ---
+    ax1 = fig.add_subplot(2, 3, 1, projection='3d')
+    ax1.plot_surface(W, T, results_smooth.K_eq, alpha=0.8, cmap=cmap_smooth,
+                     edgecolor='black', linewidth=0.3)
+    ax1.plot_surface(W, T, results_textured.K_eq, alpha=0.6, cmap=cmap_textured,
+                     edgecolor='white', linewidth=0.3)
+    ax1.set_xlabel('W, кН')
+    ax1.set_ylabel('T, °C')
+    ax1.set_zlabel('K_eq')
+    ax1.set_title('Эквивалентная жёсткость K_eq')
+
+    # --- γ²_st ---
+    ax2 = fig.add_subplot(2, 3, 2, projection='3d')
+    gamma_smooth = np.clip(results_smooth.gamma_sq, -10, 10)
+    gamma_textured = np.clip(results_textured.gamma_sq, -10, 10)
+    ax2.plot_surface(W, T, gamma_smooth, alpha=0.8, cmap=cmap_smooth,
+                     edgecolor='black', linewidth=0.3)
+    ax2.plot_surface(W, T, gamma_textured, alpha=0.6, cmap=cmap_textured,
+                     edgecolor='white', linewidth=0.3)
+    ax2.set_xlabel('W, кН')
+    ax2.set_ylabel('T, °C')
+    ax2.set_zlabel('γ²_st')
+    ax2.set_title('Квадрат логарифм. декремента γ²_st')
+
+    # --- ω_st ---
+    ax3 = fig.add_subplot(2, 3, 3, projection='3d')
+    omega_smooth = np.clip(results_smooth.omega_st, 0, 100)
+    omega_textured = np.clip(results_textured.omega_st, 0, 100)
+    ax3.plot_surface(W, T, omega_smooth, alpha=0.8, cmap=cmap_smooth,
+                     edgecolor='black', linewidth=0.3)
+    ax3.plot_surface(W, T, omega_textured, alpha=0.6, cmap=cmap_textured,
+                     edgecolor='white', linewidth=0.3)
+    ax3.set_xlabel('W, кН')
+    ax3.set_ylabel('T, °C')
+    ax3.set_zlabel('ω_st')
+    ax3.set_title('Критическая скорость ω_st')
+
+    # --- ε₀ ---
+    ax4 = fig.add_subplot(2, 3, 4, projection='3d')
+    ax4.plot_surface(W, T, results_smooth.epsilon_0, alpha=0.8, cmap=cmap_smooth,
+                     edgecolor='black', linewidth=0.3)
+    ax4.plot_surface(W, T, results_textured.epsilon_0, alpha=0.6, cmap=cmap_textured,
+                     edgecolor='white', linewidth=0.3)
+    ax4.set_xlabel('W, кН')
+    ax4.set_ylabel('T, °C')
+    ax4.set_zlabel('ε₀')
+    ax4.set_title('Статический эксцентриситет ε₀')
+
+    # --- μ_f ---
+    if results_smooth.mu_f is not None:
+        ax5 = fig.add_subplot(2, 3, 5, projection='3d')
+        ax5.plot_surface(W, T, results_smooth.mu_f, alpha=0.8, cmap=cmap_smooth,
+                         edgecolor='black', linewidth=0.3)
+        ax5.plot_surface(W, T, results_textured.mu_f, alpha=0.6, cmap=cmap_textured,
+                         edgecolor='white', linewidth=0.3)
+        ax5.set_xlabel('W, кН')
+        ax5.set_ylabel('T, °C')
+        ax5.set_zlabel('μ_f')
+        ax5.set_title('Коэффициент трения μ_f')
+
+    # --- N_f ---
+    if results_smooth.N_f is not None:
+        ax6 = fig.add_subplot(2, 3, 6, projection='3d')
+        ax6.plot_surface(W, T, results_smooth.N_f, alpha=0.8, cmap=cmap_smooth,
+                         edgecolor='black', linewidth=0.3)
+        ax6.plot_surface(W, T, results_textured.N_f, alpha=0.6, cmap=cmap_textured,
+                         edgecolor='white', linewidth=0.3)
+        ax6.set_xlabel('W, кН')
+        ax6.set_ylabel('T, °C')
+        ax6.set_zlabel('N_f, Вт')
+        ax6.set_title('Мощность потерь N_f')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'stability_surfaces_3d_grayscale.png'), dpi=300)
+    print(f"Сохранено: {save_dir}/stability_surfaces_3d_grayscale.png")
+    plt.close()
+
+
 def plot_comparison_contours(
     results_smooth: ParametricResults,
     results_textured: ParametricResults,
@@ -449,7 +653,9 @@ def run_full_analysis(
     N_W: int = 10,
     N_T: int = 8,
     save_dir: str = "results",
-    use_thd: bool = False,
+    mode: str = "isothermal",
+    use_thd: bool = False,  # Deprecated
+    grayscale: bool = False,
 ) -> Tuple[ParametricResults, ParametricResults]:
     """
     Полный анализ: расчёт для гладкого и текстурированного подшипника.
@@ -459,40 +665,54 @@ def run_full_analysis(
         N_W: число точек по нагрузке
         N_T: число точек по температуре
         save_dir: директория для результатов
-        use_thd: использовать термогидродинамический (THD) расчёт
+        mode: режим расчёта: "isothermal", "thd_mean", "thd_full"
+        use_thd: DEPRECATED - используйте mode="thd_mean"
+        grayscale: использовать градации серого для графиков (для публикаций)
 
     Returns:
         (results_smooth, results_textured)
     """
+    # Обратная совместимость
+    if use_thd and mode == "isothermal":
+        mode = "thd_mean"
+
     if model is None:
         model = create_chinese_paper_bearing()
 
+    mode_names = {
+        "isothermal": "Изотермический",
+        "thd_mean": "THD (осреднённая температура)",
+        "thd_full": "THD (полное поле вязкости)",
+    }
+
     print("=" * 60)
     print("ПАРАМЕТРИЧЕСКИЙ АНАЛИЗ ПОДШИПНИКА")
-    if use_thd:
-        print("         (режим THD — термогидродинамика)")
+    print(f"Режим: {mode_names.get(mode, mode)}")
     print("=" * 60)
     print(model.info())
 
     # Расчёт для гладкого подшипника
     print("\n--- Гладкий подшипник ---")
     results_smooth = run_parametric_calculation(
-        model, with_texture=False, N_W=N_W, N_T=N_T, use_thd=use_thd
+        model, with_texture=False, N_W=N_W, N_T=N_T, mode=mode
     )
 
     # Расчёт для текстурированного подшипника
     print("\n--- Текстурированный подшипник ---")
     results_textured = run_parametric_calculation(
-        model, with_texture=True, N_W=N_W, N_T=N_T, use_thd=use_thd
+        model, with_texture=True, N_W=N_W, N_T=N_T, mode=mode
     )
 
     # Построение графиков
     print("\nПостроение графиков...")
-    plot_3d_surfaces(results_smooth, results_textured, save_dir)
+    if grayscale:
+        plot_3d_surfaces_grayscale(results_smooth, results_textured, save_dir)
+    else:
+        plot_3d_surfaces(results_smooth, results_textured, save_dir)
     plot_comparison_contours(results_smooth, results_textured, save_dir)
 
-    # Дополнительные графики для THD
-    if use_thd:
+    # Дополнительные графики для THD режимов
+    if mode in ("thd_mean", "thd_full"):
         plot_thd_results(results_smooth, results_textured, save_dir)
 
     print("\n" + "=" * 60)
@@ -564,19 +784,33 @@ if __name__ == "__main__":
     import sys
 
     # Проверяем аргументы командной строки
-    use_thd = "--thd" in sys.argv
+    # --mode=isothermal|thd_mean|thd_full
+    # --grayscale для чёрно-белых графиков
+    # --thd (deprecated, эквивалент --mode=thd_mean)
+    mode = "isothermal"
+    grayscale = "--grayscale" in sys.argv or "--bw" in sys.argv
+
+    for arg in sys.argv:
+        if arg.startswith("--mode="):
+            mode = arg.split("=")[1]
+        elif arg == "--thd":
+            mode = "thd_mean"
+        elif arg == "--thd-full":
+            mode = "thd_full"
 
     # Запуск полного анализа
     results_smooth, results_textured = run_full_analysis(
         N_W=8,
         N_T=6,
         save_dir="results",
-        use_thd=use_thd,
+        mode=mode,
+        grayscale=grayscale,
     )
 
     # Вывод сводки по THD
-    if use_thd and results_smooth.T_mean is not None:
+    if mode in ("thd_mean", "thd_full") and results_smooth.T_mean is not None:
         print("\n--- THD Сводка ---")
+        print(f"Режим: {mode}")
         print(f"Гладкий: T_mean = {np.nanmean(results_smooth.T_mean):.1f}°C, "
               f"T_max = {np.nanmax(results_smooth.T_max):.1f}°C")
         print(f"Текстур.: T_mean = {np.nanmean(results_textured.T_mean):.1f}°C, "
