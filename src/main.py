@@ -584,9 +584,10 @@ def plot_comparison_contours(
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
     # K_eq
+    # Данные имеют форму (N_T, N_W), что соответствует (len(T), len(W)) для contourf
     ax = axes[0, 0]
-    c1 = ax.contourf(W, T, results_smooth.K_eq.T, levels=20, cmap='Blues', alpha=0.8)
-    ax.contour(W, T, results_textured.K_eq.T, levels=20, colors='red', linewidths=0.5)
+    c1 = ax.contourf(W, T, results_smooth.K_eq, levels=20, cmap='Blues', alpha=0.8)
+    ax.contour(W, T, results_textured.K_eq, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c1, ax=ax, label='K_eq (гладкий)')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T, °C')
@@ -594,8 +595,8 @@ def plot_comparison_contours(
 
     # γ²_st
     ax = axes[0, 1]
-    gamma_s = np.clip(results_smooth.gamma_sq.T, -5, 5)
-    gamma_t = np.clip(results_textured.gamma_sq.T, -5, 5)
+    gamma_s = np.clip(results_smooth.gamma_sq, -5, 5)
+    gamma_t = np.clip(results_textured.gamma_sq, -5, 5)
     c2 = ax.contourf(W, T, gamma_s, levels=20, cmap='Blues', alpha=0.8)
     ax.contour(W, T, gamma_t, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c2, ax=ax, label='γ²_st (гладкий)')
@@ -605,8 +606,8 @@ def plot_comparison_contours(
 
     # ω_st
     ax = axes[0, 2]
-    omega_s = np.clip(results_smooth.omega_st.T, 0, 50)
-    omega_t = np.clip(results_textured.omega_st.T, 0, 50)
+    omega_s = np.clip(results_smooth.omega_st, 0, 50)
+    omega_t = np.clip(results_textured.omega_st, 0, 50)
     c3 = ax.contourf(W, T, omega_s, levels=20, cmap='Blues', alpha=0.8)
     ax.contour(W, T, omega_t, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c3, ax=ax, label='ω_st (гладкий)')
@@ -616,8 +617,8 @@ def plot_comparison_contours(
 
     # ε₀
     ax = axes[1, 0]
-    c4 = ax.contourf(W, T, results_smooth.epsilon_0.T, levels=20, cmap='Blues', alpha=0.8)
-    ax.contour(W, T, results_textured.epsilon_0.T, levels=20, colors='red', linewidths=0.5)
+    c4 = ax.contourf(W, T, results_smooth.epsilon_0, levels=20, cmap='Blues', alpha=0.8)
+    ax.contour(W, T, results_textured.epsilon_0, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c4, ax=ax, label='ε₀ (гладкий)')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T, °C')
@@ -626,8 +627,8 @@ def plot_comparison_contours(
     # μ_f
     if results_smooth.mu_f is not None:
         ax = axes[1, 1]
-        c5 = ax.contourf(W, T, results_smooth.mu_f.T, levels=20, cmap='Blues', alpha=0.8)
-        ax.contour(W, T, results_textured.mu_f.T, levels=20, colors='red', linewidths=0.5)
+        c5 = ax.contourf(W, T, results_smooth.mu_f, levels=20, cmap='Blues', alpha=0.8)
+        ax.contour(W, T, results_textured.mu_f, levels=20, colors='red', linewidths=0.5)
         plt.colorbar(c5, ax=ax, label='μ_f (гладкий)')
         ax.set_xlabel('W, кН')
         ax.set_ylabel('T, °C')
@@ -636,7 +637,7 @@ def plot_comparison_contours(
     # Разница (текстурированный - гладкий)
     ax = axes[1, 2]
     delta_K_eq = results_textured.K_eq - results_smooth.K_eq
-    c6 = ax.contourf(W, T, delta_K_eq.T, levels=20, cmap='RdBu_r', alpha=0.8)
+    c6 = ax.contourf(W, T, delta_K_eq, levels=20, cmap='RdBu_r', alpha=0.8)
     plt.colorbar(c6, ax=ax, label='ΔK_eq')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T, °C')
