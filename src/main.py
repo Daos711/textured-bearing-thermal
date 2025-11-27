@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from typing import Tuple, List, Optional
 import os
 from tqdm import tqdm
+from joblib import Parallel, delayed
+import copy
 
 from .parameters import BearingModel, create_chinese_paper_bearing, create_roller_cone_bit_bearing
 from .geometry import create_grid, Grid, get_texture_centers_count
@@ -98,6 +100,180 @@ class ParametricResults:
     use_thd: bool = False                 # Использовался ли THD-расчёт (для обратной совместимости)
 
 
+@dataclass
+class SinglePointResult:
+    """Результат расчёта одной точки для параллельной обработки."""
+    i_T: int
+    i_W: int
+    epsilon_0: float
+    K_xx_bar: float
+    K_yy_bar: float
+    C_xx_bar: float
+    C_yy_bar: float
+    K_eq: float
+    gamma_sq: float
+    omega_st: float
+    mu_f: Optional[float] = None
+    N_f: Optional[float] = None
+    T_mean: Optional[float] = None
+    T_max: Optional[float] = None
+    error: Optional[str] = None
+
+
+def _compute_single_point(
+    i_T: int,
+    i_W: int,
+    T_inlet: float,
+    W: float,
+    model: BearingModel,
+    grid: Grid,
+    with_texture: bool,
+    mode: str,
+    compute_friction_flag: bool,
+) -> SinglePointResult:
+    """
+    Вычисление одной точки (W, T) для параллельной обработки.
+
+    THDSolver создаётся внутри функции для каждого процесса.
+    """
+    use_thd_any = mode in ("thd_mean", "thd_full")
+    thd_solver = THDSolver(model, grid) if use_thd_any else None
+
+    try:
+        # ================================================================
+        # РЕЖИМ: isothermal
+        # ================================================================
+        if mode == "isothermal":
+            eps_0, forces = find_equilibrium_eccentricity(
+                W, T_inlet, model, grid, with_texture=with_texture
+            )
+            T_effective = T_inlet
+            T_mean_val = None
+            T_max_val = None
+
+            K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
+            C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
+
+        # ================================================================
+        # РЕЖИМ: thd_mean
+        # ================================================================
+        elif mode == "thd_mean":
+            eps_0, forces = find_equilibrium_eccentricity(
+                W, T_inlet, model, grid, with_texture=with_texture
+            )
+
+            H_T = model.material.H_T(model.geometry, T_inlet)
+            texture = model.texture if with_texture else None
+            H = compute_film_thickness_static(
+                grid, model.geometry, eps_0, texture, H_T
+            )
+
+            original_T_inlet = model.operating.T_inlet
+            model.operating.T_inlet = T_inlet
+
+            P_thd, T_field, eta_field, thd_converged = thd_solver.solve(
+                H, max_iter=15, tol=0.5, verbose=False
+            )
+
+            model.operating.T_inlet = original_T_inlet
+
+            T_mean_val = float(np.mean(T_field))
+            T_max_val = float(np.max(T_field))
+            T_effective = T_mean_val
+
+            K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
+            C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
+
+        # ================================================================
+        # РЕЖИМ: thd_full
+        # ================================================================
+        elif mode == "thd_full":
+            eps_0, thd_result = find_equilibrium_eccentricity_thd(
+                W, T_inlet, model, grid, thd_solver,
+                with_texture=with_texture,
+                thd_max_iter=15, thd_tol=0.5
+            )
+
+            T_mean_val = thd_result.T_mean
+            T_max_val = thd_result.T_max
+            T_effective = thd_result.T_mean
+
+            K = compute_stiffness_coefficients_thd(
+                eps_0, T_inlet, model, grid, thd_solver,
+                with_texture=with_texture,
+                thd_max_iter=10, thd_tol=1.0
+            )
+            C = compute_damping_coefficients_thd(
+                eps_0, T_inlet, model, grid, thd_solver,
+                with_texture=with_texture,
+                thd_max_iter=10, thd_tol=1.0
+            )
+        else:
+            raise ValueError(f"Неизвестный режим: {mode}")
+
+        # Параметры устойчивости
+        stability = compute_stability_parameters(K, C)
+
+        # Трение (опционально)
+        mu_f_val = None
+        N_f_val = None
+        if compute_friction_flag:
+            eta_hat = model.lubricant.eta_hat(T_effective)
+            H_T = model.material.H_T(model.geometry, T_effective)
+            texture = model.texture if with_texture else None
+
+            H = compute_film_thickness_static(
+                grid, model.geometry, eps_0, texture, H_T
+            )
+
+            P, _, _ = solve_reynolds_static(
+                H, eta_hat,
+                grid.d_phi, grid.d_Z,
+                model.geometry.lambda_ratio ** 2,
+                omega_sor=model.numerical.omega_GS,
+                tol=model.numerical.tol_Re,
+                max_iter=model.numerical.max_iter_Re,
+            )
+
+            friction = compute_friction(P, H, grid, model, T_effective)
+            mu_f_val = friction.friction_coeff
+            N_f_val = friction.power_loss
+
+        return SinglePointResult(
+            i_T=i_T,
+            i_W=i_W,
+            epsilon_0=eps_0,
+            K_xx_bar=K.K_xx_bar,
+            K_yy_bar=K.K_yy_bar,
+            C_xx_bar=C.C_xx_bar,
+            C_yy_bar=C.C_yy_bar,
+            K_eq=stability.K_eq,
+            gamma_sq=stability.gamma_sq,
+            omega_st=stability.omega_st,
+            mu_f=mu_f_val,
+            N_f=N_f_val,
+            T_mean=T_mean_val,
+            T_max=T_max_val,
+        )
+
+    except Exception as e:
+        return SinglePointResult(
+            i_T=i_T,
+            i_W=i_W,
+            epsilon_0=np.nan,
+            K_xx_bar=np.nan,
+            K_yy_bar=np.nan,
+            C_xx_bar=np.nan,
+            C_yy_bar=np.nan,
+            K_eq=np.nan,
+            gamma_sq=np.nan,
+            omega_st=np.nan,
+            T_mean=np.nan if use_thd_any else None,
+            T_max=np.nan if use_thd_any else None,
+            error=str(e),
+        )
+
+
 def run_parametric_calculation(
     model: BearingModel,
     with_texture: bool = True,
@@ -107,6 +283,7 @@ def run_parametric_calculation(
     mode: str = "isothermal",
     use_thd: bool = False,  # Deprecated: используйте mode="thd_mean"
     verbose: bool = True,
+    n_jobs: int = 1,  # Число параллельных процессов (-1 = все ядра)
 ) -> ParametricResults:
     """
     Выполнить параметрический расчёт по нагрузке и температуре.
@@ -123,6 +300,7 @@ def run_parametric_calculation(
               - "thd_full": полный THD с полем вязкости η(φ,z)
         use_thd: DEPRECATED - для обратной совместимости; эквивалентно mode="thd_mean"
         verbose: выводить прогресс
+        n_jobs: число параллельных процессов (1 = последовательно, -1 = все ядра)
 
     Returns:
         ParametricResults
@@ -173,9 +351,6 @@ def run_parametric_calculation(
     # Расчётная сетка
     grid = create_grid(model.numerical.N_phi, model.numerical.N_Z)
 
-    # THD solver (создаём один раз для thd_mean и thd_full)
-    thd_solver = THDSolver(model, grid) if use_thd_any else None
-
     # Названия режимов для вывода
     mode_names = {
         "isothermal": "Изотермический",
@@ -183,9 +358,8 @@ def run_parametric_calculation(
         "thd_full": "THD (полное поле вязкости η(φ,z))",
     }
 
-    # Итератор
     total = N_T * N_W
-    iterator = range(total)
+
     if verbose:
         print(f"Параметрический расчёт: {N_T} x {N_W} = {total} точек")
         print(f"Текстура: {'Да' if with_texture else 'Нет'}")
@@ -196,125 +370,159 @@ def run_parametric_calculation(
         if use_thd_any:
             delta_T_est = estimate_temperature_rise(model)
             print(f"  Оценка подъёма температуры: ΔT ≈ {delta_T_est:.1f}°C")
-        iterator = tqdm(iterator, desc="Расчёт")
+        if n_jobs != 1:
+            actual_jobs = n_jobs if n_jobs > 0 else os.cpu_count()
+            print(f"  Параллельных процессов: {actual_jobs}")
 
-    for idx in iterator:
+    # Подготовка списка задач
+    tasks = []
+    for idx in range(total):
         i_T = idx // N_W
         i_W = idx % N_W
+        tasks.append((i_T, i_W, T_arr[i_T], W_arr[i_W]))
 
-        T_inlet = T_arr[i_T]  # Входная температура
-        W = W_arr[i_W]
+    # ========================================================================
+    # ПАРАЛЛЕЛЬНЫЙ РАСЧЁТ
+    # ========================================================================
+    if n_jobs != 1:
+        # Создаём копию модели для каждого процесса (для безопасности)
+        results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
+            delayed(_compute_single_point)(
+                i_T, i_W, T_inlet, W,
+                copy.deepcopy(model), grid,
+                with_texture, mode, compute_friction_flag
+            )
+            for i_T, i_W, T_inlet, W in tqdm(tasks, desc="Расчёт", disable=not verbose)
+        )
 
-        try:
-            # ================================================================
-            # РЕЖИМ: isothermal
-            # ================================================================
-            if mode == "isothermal":
-                # Поиск равновесного эксцентриситета (изотермический)
-                eps_0, forces = find_equilibrium_eccentricity(
-                    W, T_inlet, model, grid, with_texture=with_texture
-                )
-                epsilon_0[i_T, i_W] = eps_0
-                T_effective = T_inlet
+        # Заполняем массивы результатами
+        for res in results:
+            i_T, i_W = res.i_T, res.i_W
+            epsilon_0[i_T, i_W] = res.epsilon_0
+            K_xx_bar[i_T, i_W] = res.K_xx_bar
+            K_yy_bar[i_T, i_W] = res.K_yy_bar
+            C_xx_bar[i_T, i_W] = res.C_xx_bar
+            C_yy_bar[i_T, i_W] = res.C_yy_bar
+            K_eq[i_T, i_W] = res.K_eq
+            gamma_sq[i_T, i_W] = res.gamma_sq
+            omega_st[i_T, i_W] = res.omega_st
 
-                # Коэффициенты жёсткости и демпфирования (изотермические)
-                K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
-                C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
+            if compute_friction_flag and res.mu_f is not None:
+                mu_f[i_T, i_W] = res.mu_f
+                N_f[i_T, i_W] = res.N_f
 
-            # ================================================================
-            # РЕЖИМ: thd_mean (быстрый THD с осреднённой температурой)
-            # ================================================================
-            elif mode == "thd_mean":
-                # Сначала находим ε₀ изотермически
-                eps_0, forces = find_equilibrium_eccentricity(
-                    W, T_inlet, model, grid, with_texture=with_texture
-                )
-                epsilon_0[i_T, i_W] = eps_0
+            if use_thd_any and res.T_mean is not None:
+                T_mean_arr[i_T, i_W] = res.T_mean
+                T_max_arr[i_T, i_W] = res.T_max
 
-                # Вычисляем зазор при найденном ε₀
-                H_T = model.material.H_T(model.geometry, T_inlet)
-                texture = model.texture if with_texture else None
-                H = compute_film_thickness_static(
-                    grid, model.geometry, eps_0, texture, H_T
-                )
+            if res.error and verbose:
+                print(f"\nОшибка в точке (W={W_arr[i_W]:.0f}, T={T_arr[i_T]:.0f}): {res.error}")
 
-                # Временно меняем T_inlet в модели для THD
-                original_T_inlet = model.operating.T_inlet
-                model.operating.T_inlet = T_inlet
+    # ========================================================================
+    # ПОСЛЕДОВАТЕЛЬНЫЙ РАСЧЁТ (n_jobs=1)
+    # ========================================================================
+    else:
+        # THD solver (создаём один раз)
+        thd_solver = THDSolver(model, grid) if use_thd_any else None
 
-                # Решаем THD задачу для получения T_mean
-                P_thd, T_field, eta_field, thd_converged = thd_solver.solve(
-                    H, max_iter=15, tol=0.5, verbose=False
-                )
+        iterator = tqdm(tasks, desc="Расчёт", disable=not verbose)
 
-                # Восстанавливаем
-                model.operating.T_inlet = original_T_inlet
+        for i_T, i_W, T_inlet, W in iterator:
+            try:
+                # ============================================================
+                # РЕЖИМ: isothermal
+                # ============================================================
+                if mode == "isothermal":
+                    eps_0, forces = find_equilibrium_eccentricity(
+                        W, T_inlet, model, grid, with_texture=with_texture
+                    )
+                    epsilon_0[i_T, i_W] = eps_0
+                    T_effective = T_inlet
 
-                # Средняя и максимальная температура
-                T_mean = np.mean(T_field)
-                T_max = np.max(T_field)
-                T_mean_arr[i_T, i_W] = T_mean
-                T_max_arr[i_T, i_W] = T_max
+                    K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
+                    C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
 
-                # Используем T_mean для расчёта коэффициентов (изотермический расчёт при T_mean)
-                T_effective = T_mean
-                K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
-                C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
+                # ============================================================
+                # РЕЖИМ: thd_mean
+                # ============================================================
+                elif mode == "thd_mean":
+                    eps_0, forces = find_equilibrium_eccentricity(
+                        W, T_inlet, model, grid, with_texture=with_texture
+                    )
+                    epsilon_0[i_T, i_W] = eps_0
 
-            # ================================================================
-            # РЕЖИМ: thd_full (полный THD с полем вязкости)
-            # ================================================================
-            elif mode == "thd_full":
-                # Поиск ε₀ с полным THD на каждой итерации
-                eps_0, thd_result = find_equilibrium_eccentricity_thd(
-                    W, T_inlet, model, grid, thd_solver,
-                    with_texture=with_texture,
-                    thd_max_iter=15, thd_tol=0.5
-                )
-                epsilon_0[i_T, i_W] = eps_0
+                    H_T = model.material.H_T(model.geometry, T_inlet)
+                    texture = model.texture if with_texture else None
+                    H = compute_film_thickness_static(
+                        grid, model.geometry, eps_0, texture, H_T
+                    )
 
-                # Сохраняем температуры из THD
-                T_mean_arr[i_T, i_W] = thd_result.T_mean
-                T_max_arr[i_T, i_W] = thd_result.T_max
-                T_effective = thd_result.T_mean
+                    original_T_inlet = model.operating.T_inlet
+                    model.operating.T_inlet = T_inlet
 
-                # Коэффициенты K и C с полным THD (поле вязкости η(φ,z))
-                K = compute_stiffness_coefficients_thd(
-                    eps_0, T_inlet, model, grid, thd_solver,
-                    with_texture=with_texture,
-                    thd_max_iter=10, thd_tol=1.0
-                )
-                C = compute_damping_coefficients_thd(
-                    eps_0, T_inlet, model, grid, thd_solver,
-                    with_texture=with_texture,
-                    thd_max_iter=10, thd_tol=1.0
-                )
+                    P_thd, T_field, eta_field, thd_converged = thd_solver.solve(
+                        H, max_iter=15, tol=0.5, verbose=False
+                    )
 
-            # Сохраняем коэффициенты
-            K_xx_bar[i_T, i_W] = K.K_xx_bar
-            K_yy_bar[i_T, i_W] = K.K_yy_bar
-            C_xx_bar[i_T, i_W] = C.C_xx_bar
-            C_yy_bar[i_T, i_W] = C.C_yy_bar
+                    model.operating.T_inlet = original_T_inlet
 
-            # Параметры устойчивости
-            stability = compute_stability_parameters(K, C)
-            K_eq[i_T, i_W] = stability.K_eq
-            gamma_sq[i_T, i_W] = stability.gamma_sq
-            omega_st[i_T, i_W] = stability.omega_st
+                    T_mean_val = np.mean(T_field)
+                    T_max_val = np.max(T_field)
+                    T_mean_arr[i_T, i_W] = T_mean_val
+                    T_max_arr[i_T, i_W] = T_max_val
 
-            # Трение (опционально)
-            if compute_friction_flag:
-                eta_hat = model.lubricant.eta_hat(T_effective)
-                H_T = model.material.H_T(model.geometry, T_effective)
-                texture = model.texture if with_texture else None
+                    T_effective = T_mean_val
+                    K = compute_stiffness_coefficients(eps_0, T_effective, model, grid, with_texture)
+                    C = compute_damping_coefficients(eps_0, T_effective, model, grid, with_texture)
 
-                H = compute_film_thickness_static(
-                    grid, model.geometry, eps_0, texture, H_T
-                )
+                # ============================================================
+                # РЕЖИМ: thd_full
+                # ============================================================
+                elif mode == "thd_full":
+                    eps_0, thd_result = find_equilibrium_eccentricity_thd(
+                        W, T_inlet, model, grid, thd_solver,
+                        with_texture=with_texture,
+                        thd_max_iter=15, thd_tol=0.5
+                    )
+                    epsilon_0[i_T, i_W] = eps_0
 
-                if mode == "thd_full":
-                    # Для thd_full используем P из THD (если доступно)
-                    # Упрощённо: пересчитываем при T_effective
+                    T_mean_arr[i_T, i_W] = thd_result.T_mean
+                    T_max_arr[i_T, i_W] = thd_result.T_max
+                    T_effective = thd_result.T_mean
+
+                    K = compute_stiffness_coefficients_thd(
+                        eps_0, T_inlet, model, grid, thd_solver,
+                        with_texture=with_texture,
+                        thd_max_iter=10, thd_tol=1.0
+                    )
+                    C = compute_damping_coefficients_thd(
+                        eps_0, T_inlet, model, grid, thd_solver,
+                        with_texture=with_texture,
+                        thd_max_iter=10, thd_tol=1.0
+                    )
+
+                # Сохраняем коэффициенты
+                K_xx_bar[i_T, i_W] = K.K_xx_bar
+                K_yy_bar[i_T, i_W] = K.K_yy_bar
+                C_xx_bar[i_T, i_W] = C.C_xx_bar
+                C_yy_bar[i_T, i_W] = C.C_yy_bar
+
+                # Параметры устойчивости
+                stability = compute_stability_parameters(K, C)
+                K_eq[i_T, i_W] = stability.K_eq
+                gamma_sq[i_T, i_W] = stability.gamma_sq
+                omega_st[i_T, i_W] = stability.omega_st
+
+                # Трение
+                if compute_friction_flag:
+                    eta_hat = model.lubricant.eta_hat(T_effective)
+                    H_T = model.material.H_T(model.geometry, T_effective)
+                    texture = model.texture if with_texture else None
+
+                    H = compute_film_thickness_static(
+                        grid, model.geometry, eps_0, texture, H_T
+                    )
+
                     P, _, _ = solve_reynolds_static(
                         H, eta_hat,
                         grid.d_phi, grid.d_Z,
@@ -323,30 +531,21 @@ def run_parametric_calculation(
                         tol=model.numerical.tol_Re,
                         max_iter=model.numerical.max_iter_Re,
                     )
-                else:
-                    P, _, _ = solve_reynolds_static(
-                        H, eta_hat,
-                        grid.d_phi, grid.d_Z,
-                        model.geometry.lambda_ratio ** 2,
-                        omega_sor=model.numerical.omega_GS,
-                        tol=model.numerical.tol_Re,
-                        max_iter=model.numerical.max_iter_Re,
-                    )
 
-                friction = compute_friction(P, H, grid, model, T_effective)
-                mu_f[i_T, i_W] = friction.friction_coeff
-                N_f[i_T, i_W] = friction.power_loss
+                    friction = compute_friction(P, H, grid, model, T_effective)
+                    mu_f[i_T, i_W] = friction.friction_coeff
+                    N_f[i_T, i_W] = friction.power_loss
 
-        except Exception as e:
-            if verbose:
-                print(f"\nОшибка в точке (W={W:.0f}, T={T_inlet:.0f}): {e}")
-            epsilon_0[i_T, i_W] = np.nan
-            K_eq[i_T, i_W] = np.nan
-            gamma_sq[i_T, i_W] = np.nan
-            omega_st[i_T, i_W] = np.nan
-            if use_thd_any:
-                T_mean_arr[i_T, i_W] = np.nan
-                T_max_arr[i_T, i_W] = np.nan
+            except Exception as e:
+                if verbose:
+                    print(f"\nОшибка в точке (W={W:.0f}, T={T_inlet:.0f}): {e}")
+                epsilon_0[i_T, i_W] = np.nan
+                K_eq[i_T, i_W] = np.nan
+                gamma_sq[i_T, i_W] = np.nan
+                omega_st[i_T, i_W] = np.nan
+                if use_thd_any:
+                    T_mean_arr[i_T, i_W] = np.nan
+                    T_max_arr[i_T, i_W] = np.nan
 
     return ParametricResults(
         W_arr=W_arr,
@@ -584,9 +783,10 @@ def plot_comparison_contours(
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
 
     # K_eq
+    # Данные имеют форму (N_T, N_W), что соответствует (len(T), len(W)) для contourf
     ax = axes[0, 0]
-    c1 = ax.contourf(W, T, results_smooth.K_eq.T, levels=20, cmap='Blues', alpha=0.8)
-    ax.contour(W, T, results_textured.K_eq.T, levels=20, colors='red', linewidths=0.5)
+    c1 = ax.contourf(W, T, results_smooth.K_eq, levels=20, cmap='Blues', alpha=0.8)
+    ax.contour(W, T, results_textured.K_eq, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c1, ax=ax, label='K_eq (гладкий)')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T, °C')
@@ -594,8 +794,8 @@ def plot_comparison_contours(
 
     # γ²_st
     ax = axes[0, 1]
-    gamma_s = np.clip(results_smooth.gamma_sq.T, -5, 5)
-    gamma_t = np.clip(results_textured.gamma_sq.T, -5, 5)
+    gamma_s = np.clip(results_smooth.gamma_sq, -5, 5)
+    gamma_t = np.clip(results_textured.gamma_sq, -5, 5)
     c2 = ax.contourf(W, T, gamma_s, levels=20, cmap='Blues', alpha=0.8)
     ax.contour(W, T, gamma_t, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c2, ax=ax, label='γ²_st (гладкий)')
@@ -605,8 +805,8 @@ def plot_comparison_contours(
 
     # ω_st
     ax = axes[0, 2]
-    omega_s = np.clip(results_smooth.omega_st.T, 0, 50)
-    omega_t = np.clip(results_textured.omega_st.T, 0, 50)
+    omega_s = np.clip(results_smooth.omega_st, 0, 50)
+    omega_t = np.clip(results_textured.omega_st, 0, 50)
     c3 = ax.contourf(W, T, omega_s, levels=20, cmap='Blues', alpha=0.8)
     ax.contour(W, T, omega_t, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c3, ax=ax, label='ω_st (гладкий)')
@@ -616,8 +816,8 @@ def plot_comparison_contours(
 
     # ε₀
     ax = axes[1, 0]
-    c4 = ax.contourf(W, T, results_smooth.epsilon_0.T, levels=20, cmap='Blues', alpha=0.8)
-    ax.contour(W, T, results_textured.epsilon_0.T, levels=20, colors='red', linewidths=0.5)
+    c4 = ax.contourf(W, T, results_smooth.epsilon_0, levels=20, cmap='Blues', alpha=0.8)
+    ax.contour(W, T, results_textured.epsilon_0, levels=20, colors='red', linewidths=0.5)
     plt.colorbar(c4, ax=ax, label='ε₀ (гладкий)')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T, °C')
@@ -626,8 +826,8 @@ def plot_comparison_contours(
     # μ_f
     if results_smooth.mu_f is not None:
         ax = axes[1, 1]
-        c5 = ax.contourf(W, T, results_smooth.mu_f.T, levels=20, cmap='Blues', alpha=0.8)
-        ax.contour(W, T, results_textured.mu_f.T, levels=20, colors='red', linewidths=0.5)
+        c5 = ax.contourf(W, T, results_smooth.mu_f, levels=20, cmap='Blues', alpha=0.8)
+        ax.contour(W, T, results_textured.mu_f, levels=20, colors='red', linewidths=0.5)
         plt.colorbar(c5, ax=ax, label='μ_f (гладкий)')
         ax.set_xlabel('W, кН')
         ax.set_ylabel('T, °C')
@@ -636,7 +836,7 @@ def plot_comparison_contours(
     # Разница (текстурированный - гладкий)
     ax = axes[1, 2]
     delta_K_eq = results_textured.K_eq - results_smooth.K_eq
-    c6 = ax.contourf(W, T, delta_K_eq.T, levels=20, cmap='RdBu_r', alpha=0.8)
+    c6 = ax.contourf(W, T, delta_K_eq, levels=20, cmap='RdBu_r', alpha=0.8)
     plt.colorbar(c6, ax=ax, label='ΔK_eq')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T, °C')
@@ -656,6 +856,7 @@ def run_full_analysis(
     mode: str = "isothermal",
     use_thd: bool = False,  # Deprecated
     grayscale: bool = False,
+    n_jobs: int = 1,  # Число параллельных процессов (-1 = все ядра)
 ) -> Tuple[ParametricResults, ParametricResults]:
     """
     Полный анализ: расчёт для гладкого и текстурированного подшипника.
@@ -668,6 +869,7 @@ def run_full_analysis(
         mode: режим расчёта: "isothermal", "thd_mean", "thd_full"
         use_thd: DEPRECATED - используйте mode="thd_mean"
         grayscale: использовать градации серого для графиков (для публикаций)
+        n_jobs: число параллельных процессов (1 = последовательно, -1 = все ядра)
 
     Returns:
         (results_smooth, results_textured)
@@ -694,13 +896,13 @@ def run_full_analysis(
     # Расчёт для гладкого подшипника
     print("\n--- Гладкий подшипник ---")
     results_smooth = run_parametric_calculation(
-        model, with_texture=False, N_W=N_W, N_T=N_T, mode=mode
+        model, with_texture=False, N_W=N_W, N_T=N_T, mode=mode, n_jobs=n_jobs
     )
 
     # Расчёт для текстурированного подшипника
     print("\n--- Текстурированный подшипник ---")
     results_textured = run_parametric_calculation(
-        model, with_texture=True, N_W=N_W, N_T=N_T, mode=mode
+        model, with_texture=True, N_W=N_W, N_T=N_T, mode=mode, n_jobs=n_jobs
     )
 
     # Построение графиков
@@ -742,7 +944,7 @@ def plot_thd_results(
 
     # T_mean гладкий
     ax = axes[0, 0]
-    c = ax.contourf(W, T_inlet, results_smooth.T_mean.T, levels=20, cmap='hot')
+    c = ax.contourf(W, T_inlet, results_smooth.T_mean, levels=20, cmap='hot')
     plt.colorbar(c, ax=ax, label='T_mean, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
@@ -750,7 +952,7 @@ def plot_thd_results(
 
     # T_mean текстурированный
     ax = axes[0, 1]
-    c = ax.contourf(W, T_inlet, results_textured.T_mean.T, levels=20, cmap='hot')
+    c = ax.contourf(W, T_inlet, results_textured.T_mean, levels=20, cmap='hot')
     plt.colorbar(c, ax=ax, label='T_mean, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
@@ -759,7 +961,7 @@ def plot_thd_results(
     # ΔT = T_mean - T_inlet
     ax = axes[1, 0]
     delta_T_smooth = results_smooth.T_mean - results_smooth.T_mesh
-    c = ax.contourf(W, T_inlet, delta_T_smooth.T, levels=20, cmap='Reds')
+    c = ax.contourf(W, T_inlet, delta_T_smooth, levels=20, cmap='Reds')
     plt.colorbar(c, ax=ax, label='ΔT, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
@@ -768,7 +970,7 @@ def plot_thd_results(
     # Разница T_mean текстурир. - гладкий
     ax = axes[1, 1]
     delta_T = results_textured.T_mean - results_smooth.T_mean
-    c = ax.contourf(W, T_inlet, delta_T.T, levels=20, cmap='RdBu_r')
+    c = ax.contourf(W, T_inlet, delta_T, levels=20, cmap='RdBu_r')
     plt.colorbar(c, ax=ax, label='ΔT, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
