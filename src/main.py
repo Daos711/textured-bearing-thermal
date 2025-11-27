@@ -743,7 +743,7 @@ def plot_thd_results(
 
     # T_mean гладкий
     ax = axes[0, 0]
-    c = ax.contourf(W, T_inlet, results_smooth.T_mean.T, levels=20, cmap='hot')
+    c = ax.contourf(W, T_inlet, results_smooth.T_mean, levels=20, cmap='hot')
     plt.colorbar(c, ax=ax, label='T_mean, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
@@ -751,7 +751,7 @@ def plot_thd_results(
 
     # T_mean текстурированный
     ax = axes[0, 1]
-    c = ax.contourf(W, T_inlet, results_textured.T_mean.T, levels=20, cmap='hot')
+    c = ax.contourf(W, T_inlet, results_textured.T_mean, levels=20, cmap='hot')
     plt.colorbar(c, ax=ax, label='T_mean, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
@@ -760,7 +760,7 @@ def plot_thd_results(
     # ΔT = T_mean - T_inlet
     ax = axes[1, 0]
     delta_T_smooth = results_smooth.T_mean - results_smooth.T_mesh
-    c = ax.contourf(W, T_inlet, delta_T_smooth.T, levels=20, cmap='Reds')
+    c = ax.contourf(W, T_inlet, delta_T_smooth, levels=20, cmap='Reds')
     plt.colorbar(c, ax=ax, label='ΔT, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
@@ -769,7 +769,7 @@ def plot_thd_results(
     # Разница T_mean текстурир. - гладкий
     ax = axes[1, 1]
     delta_T = results_textured.T_mean - results_smooth.T_mean
-    c = ax.contourf(W, T_inlet, delta_T.T, levels=20, cmap='RdBu_r')
+    c = ax.contourf(W, T_inlet, delta_T, levels=20, cmap='RdBu_r')
     plt.colorbar(c, ax=ax, label='ΔT, °C')
     ax.set_xlabel('W, кН')
     ax.set_ylabel('T_inlet, °C')
