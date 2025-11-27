@@ -333,7 +333,7 @@ def create_roller_cone_bit_bearing(
 
     texture = TextureParameters(
         enabled=True,
-        h_p=100e-6,             # 100 мкм глубина
+        h_p=10e-6,              # 10 мкм глубина (h_p/c₀ = 0.2)
         a=2.41e-3,              # 2.41 мм полуось по z (эллипс)
         b=2.214e-3,             # 2.214 мм полуось по φ (эллипс)
         use_phyllotaxis=True,
