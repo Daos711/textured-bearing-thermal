@@ -22,8 +22,14 @@
     # Быстрый тест
     python examples/roller_cone_bit_analysis.py --quick
 
-    # Полный расчёт
+    # Полный расчёт (параллельно на всех ядрах по умолчанию)
     python examples/roller_cone_bit_analysis.py --mode=thd_full --full --grayscale
+
+    # Последовательный расчёт (без параллелизации)
+    python examples/roller_cone_bit_analysis.py --mode=thd_full --full -j 1
+
+    # Указать число потоков вручную (например, 16)
+    python examples/roller_cone_bit_analysis.py --mode=thd_full --full -j 16
 """
 
 import sys
@@ -121,13 +127,14 @@ def single_point_analysis():
     print(f"  ΔK_eq = {delta_Keq:+.2f}%")
 
 
-def parametric_analysis_small(mode: str = "thd_mean", grayscale: bool = False):
+def parametric_analysis_small(mode: str = "thd_mean", grayscale: bool = False, n_jobs: int = -1):
     """
     Небольшой параметрический расчёт для быстрой проверки.
 
     Args:
         mode: режим расчёта ("isothermal", "thd_mean", "thd_full")
         grayscale: использовать чёрно-белые графики для публикации
+        n_jobs: число параллельных процессов (-1 = все ядра)
     """
     print("\n" + "=" * 60)
     print("ПАРАМЕТРИЧЕСКИЙ РАСЧЁТ (МАЛЫЙ)")
@@ -142,11 +149,11 @@ def parametric_analysis_small(mode: str = "thd_mean", grayscale: bool = False):
     # mode="thd_mean" — быстрый THD с осреднённой температурой
     # mode="thd_full" — полный THD с полем вязкости η(φ,z)
     results_smooth = run_parametric_calculation(
-        model, with_texture=False, N_W=5, N_T=4, mode=mode
+        model, with_texture=False, N_W=5, N_T=4, mode=mode, n_jobs=n_jobs
     )
 
     results_textured = run_parametric_calculation(
-        model, with_texture=True, N_W=5, N_T=4, mode=mode
+        model, with_texture=True, N_W=5, N_T=4, mode=mode, n_jobs=n_jobs
     )
 
     print("\n--- Результаты (гладкий) ---")
@@ -164,7 +171,7 @@ def parametric_analysis_small(mode: str = "thd_mean", grayscale: bool = False):
     plt.show()
 
 
-def parametric_analysis_full(mode: str = "thd_mean", grayscale: bool = False):
+def parametric_analysis_full(mode: str = "thd_mean", grayscale: bool = False, n_jobs: int = -1):
     """
     Полный параметрический расчёт.
 
@@ -174,6 +181,7 @@ def parametric_analysis_full(mode: str = "thd_mean", grayscale: bool = False):
               - "thd_mean" — THD с осреднённой температурой
               - "thd_full" — полный THD с полем вязкости η(φ,z)
         grayscale: чёрно-белые графики для публикации
+        n_jobs: число параллельных процессов (-1 = все ядра)
     """
     print("\n" + "=" * 60)
     print("ПОЛНЫЙ ПАРАМЕТРИЧЕСКИЙ РАСЧЁТ")
@@ -195,6 +203,7 @@ def parametric_analysis_full(mode: str = "thd_mean", grayscale: bool = False):
         save_dir=RESULTS_DIR,
         mode=mode,
         grayscale=grayscale,
+        n_jobs=n_jobs,
     )
 
     plt.show()
@@ -635,6 +644,10 @@ def main():
         "--quick", action="store_true",
         help="Только быстрые тесты (без переборов)"
     )
+    parser.add_argument(
+        "--jobs", "-j", type=int, default=-1,
+        help="Число параллельных процессов (-1 = все ядра, 1 = последовательно)"
+    )
 
     args = parser.parse_args()
 
@@ -644,6 +657,8 @@ def main():
     print("=" * 60)
     print(f"Режим THD: {args.mode}")
     print(f"Чёрно-белые графики: {'Да' if args.grayscale else 'Нет'}")
+    n_jobs_display = args.jobs if args.jobs > 0 else os.cpu_count()
+    print(f"Параллельных процессов: {n_jobs_display}")
 
     # 1. Анализ в одной точке
     single_point_analysis()
@@ -652,7 +667,7 @@ def main():
     compare_temperature_effect()
 
     # 3. Малый параметрический расчёт
-    parametric_analysis_small(mode=args.mode, grayscale=args.grayscale)
+    parametric_analysis_small(mode=args.mode, grayscale=args.grayscale, n_jobs=args.jobs)
 
     if not args.quick:
         # 4. Графики γ²_st(W) при фиксированных T
@@ -666,7 +681,7 @@ def main():
 
     # 7. Полный параметрический расчёт (если запрошен)
     if args.full:
-        parametric_analysis_full(mode=args.mode, grayscale=args.grayscale)
+        parametric_analysis_full(mode=args.mode, grayscale=args.grayscale, n_jobs=args.jobs)
 
     print("\n" + "=" * 60)
     print("АНАЛИЗ ЗАВЕРШЁН")
